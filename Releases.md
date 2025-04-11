@@ -6,6 +6,85 @@ https://github.com/denoland/deno/releases
 We also have one-line install commands at:
 https://github.com/denoland/deno_install
 
+### 2.2.9 / 2025.04.11
+
+- fix(build): upgrade libffi to 4.0.0 (#28816)
+- fix(compile): do not panic including node_modules directory (#28782)
+- fix(compile): multi icon ordering on windows (#28771)
+- fix(ext/canvas): handle integer overflow in `createImageBitmap` (#28764)
+- fix(ext/node): add createReadStream & createWriteStream methods to the
+  FileHandle class (#28700)
+- fix(ext/node): add support for --no- prefix (allowNegative option) in
+  parseArgs() (#28811)
+- fix(ext/node): alias `shake-128` and `shake-256` hash algorithms (#28451)
+- fix(ext/node): implement `Buffer.copyBytesFrom` (#28829)
+- fix(ext/node): implement `process.loadEnvFile` (#28824)
+- fix(ext/node): implement finished() for web streams (#28600)
+- fix(ext/node): return `Buffer` from crypto cipher APIs (#28826)
+- fix(ext/node): support input option in spawnSync (#28792)
+- fix(ext/node): use primordials in `ext/node/polyfills/path/_posix.ts` (#28665)
+- fix(ext/node): use primordials in `ext/node/polyfills/path/_win32.ts` (#28668)
+- fix(ext/node): use primordials in `ext/node/polyfills/path/separator.ts`
+  (#28669)
+- fix(ext/node): verbose zlib error messages (#28831)
+- fix(install): handle when bin entry info isn't present in package.json but is
+  in registry (#28822)
+- fix(install): regression where Deno not used when postinstall script ran
+  script without file extension (#28786)
+- fix(lockfile): handling of peer deps when migrating to lockfile v5 (#28844)
+- fix(lockfile): omit tarball url from lockfile if it's the default (#28842)
+- fix(lsp): exclude unmapped npm cache paths from auto-imports (#28841)
+- fix(node): add reset method to event loop delay histogram (#28788)
+- fix(task): support backticks and basic tilde expansion (#28832)
+- fix(unstable): add missing decorators nodes in lint ast (#28834)
+- fix(unstable): add parent types to lint ast nodes (#28802)
+- fix(unstable): lint `.parent` property not traversing over groups (#28803)
+- fix: dont strip n-api symbols in `denort` on mac (#28800)
+- fix: use full SHA for canary panic URLs (#28819)
+- perf(npm): load npm resolution snapshot directly from lockfile (#28647)
+
+### 2.2.8 / 2025.04.05
+
+- fix(compile): ensure atime/birthtime/mtime/ctime is set in vfs (#28731)
+- fix(fmt): use non-zero exit code when formatting fails (#28523)
+- fix(lint): resolve plugin paths from proper config specifier (#28752)
+- fix(lsp): filter scheme in semantic tokens registration options (#28756)
+- fix: only strip local and debug symbols from macOS binary to fix Node API
+  (#28758)
+- fix: upgrade v8 to 135.1.0 (#28697)
+
+### 2.2.7 / 2025.04.04
+
+- feat(unstable/otel): v8js metrics (#28592)
+- fix(ext/node): better dns.lookup compatibility (#27936)
+- fix(ext/node): sqlite handle empty blob being NULL (#28674)
+- fix(ext/node): support the optional `previousValue` parameter for
+  process.cpuUsage() (#28550)
+- fix(ext/node): use primordials in `ext/node/polyfills/_fs/_fs_lstat.ts`
+  (#28644)
+- fix(ext/node): use primordials in `ext/node/polyfills/_fs/_fs_readv.ts`
+  (#28645)
+- fix(ext/node): use primordials in `ext/node/polyfills/_fs/_fs_realpath.ts`
+  (#28652)
+- fix(ext/webgpu): release current texture of surface after present (#28691)
+- fix(install): remove duplicate deprecated messages (#28738)
+- fix(lsp): format vscode-userdata schemed documents (#28706)
+- fix(lsp): preserve notification order after init flag is raised (#28733)
+- fix(lsp): url_to_uri() encoding on windows (#28737)
+- fix(npm): further reduce duplicates with optional peers (#28705)
+- fix(npm): reduce duplicate peers by preferring existing nv if nv anywhere in
+  ancestor peers (#28663)
+- fix(npm): use Deno instead of Node in more cases for lifecycle scripts
+  (#28715)
+- fix(runtime): fix duplicate unstable ids for no-legacy-abort (#28740)
+- fix(task): filter empty elements in `xargs` (#28714)
+- fix(test): ignore write errors in reporter (#28722)
+- fix(types): add `Error.isError` type (#28679)
+- fix(webgpu): move `isFallbackAdapter` from `GPUAdapter` to `GPUAdapterInfo`
+  (#28650)
+- fix: show referrer for Wasm module dependency errors (#28653)
+- perf: remote symbolicate stack traces (#28470)
+
 ### 2.2.6 / 2025.03.28
 
 - feat(unstable/run): ability to lazily load statically analyzable dynamic
