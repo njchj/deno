@@ -1,4 +1,4 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 export interface AstContext {
   buf: Uint8Array;
@@ -8,6 +8,8 @@ export interface AstContext {
   nodes: Map<number, Deno.lint.Node>;
   spansOffset: number;
   propsOffset: number;
+  commentsOffset: number;
+  comments: Array<Deno.lint.LineComment | Deno.lint.BlockComment>;
   strByType: number[];
   strByProp: number[];
   typeByStr: Map<string, number>;

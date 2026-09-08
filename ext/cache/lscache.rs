@@ -1,4 +1,4 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -6,28 +6,29 @@ use std::rc::Rc;
 use async_stream::try_stream;
 use base64::Engine;
 use bytes::Bytes;
-use deno_core::unsync::spawn;
 use deno_core::BufMutView;
-use deno_core::ByteString;
 use deno_core::Resource;
+use deno_core::convert::ByteString;
+use deno_core::unsync::spawn;
 use futures::StreamExt;
 use futures::TryStreamExt;
-use http::header::VARY;
 use http::HeaderMap;
 use http::HeaderName;
 use http::HeaderValue;
+use http::header::VARY;
 use http_body_util::combinators::UnsyncBoxBody;
 use slab::Slab;
 
-use crate::get_header;
-use crate::get_headers_from_vary_header;
-use crate::lsc_shard::CacheShard;
 use crate::CacheDeleteRequest;
 use crate::CacheError;
+use crate::CacheKeyEntry;
 use crate::CacheMatchRequest;
 use crate::CacheMatchResponseMeta;
 use crate::CachePutRequest;
 use crate::CacheResponseResource;
+use crate::get_header;
+use crate::get_headers_from_vary_header;
+use crate::lsc_shard::CacheShard;
 
 const REQHDR_PREFIX: &str = "x-lsc-meta-reqhdr-";
 
@@ -43,7 +44,7 @@ impl LscBackend {
   }
 }
 
-#[allow(clippy::unused_async)]
+#[allow(clippy::unused_async, reason = "trait requires async interface")]
 impl LscBackend {
   /// Open a cache storage. Internally, this allocates an id and maps it
   /// to the provided cache name.
@@ -74,6 +75,18 @@ impl LscBackend {
     Err(CacheError::DeletionNotSupported)
   }
 
+  /// List all cache names currently known to this backend.
+  pub async fn storage_keys(&self) -> Result<Vec<String>, CacheError> {
+    let mut seen = std::collections::HashSet::new();
+    let mut names = Vec::new();
+    for (_, name) in self.id2name.borrow().iter() {
+      if seen.insert(name.clone()) {
+        names.push(name.clone());
+      }
+    }
+    Ok(names)
+  }
+
   /// Writes an entry to the cache.
   pub async fn put(
     &self,
@@ -98,7 +111,7 @@ impl LscBackend {
     );
     let mut headers = HeaderMap::new();
     for hdr in &request_response.request_headers {
-      headers.insert(
+      headers.append(
         HeaderName::from_bytes(
           &[REQHDR_PREFIX.as_bytes(), &hdr.0[..]].concat(),
         )?,
@@ -112,7 +125,7 @@ impl LscBackend {
       if hdr.0[..] == b"content-encoding"[..] {
         return Err(CacheError::ContentEncodingNotAllowed);
       }
-      headers.insert(
+      headers.append(
         HeaderName::from_bytes(&hdr.0[..])?,
         HeaderValue::from_bytes(&hdr.1[..])?,
       );
@@ -183,14 +196,14 @@ impl LscBackend {
     // From https://w3c.github.io/ServiceWorker/#request-matches-cached-item-algorithm
     // If there's Vary header in the response, ensure all the
     // headers of the cached request match the query request.
-    if let Some(vary_header) = res.headers().get(&VARY) {
-      if !vary_header_matches(
-        vary_header.as_bytes(),
+    if let Some(vary_header) = get_header_from_map(VARY.as_str(), res.headers())
+      && !vary_header_matches(
+        &vary_header,
         &request.request_headers,
         res.headers(),
-      ) {
-        return Ok(None);
-      }
+      )
+    {
+      return Ok(None);
     }
 
     let mut response_headers: Vec<(ByteString, ByteString)> = res
@@ -209,14 +222,13 @@ impl LscBackend {
       .headers()
       .get("x-lsc-meta-cached-at")
       .and_then(|x| x.to_str().ok())
+      && let Ok(cached_at) = chrono::DateTime::parse_from_rfc3339(x)
     {
-      if let Ok(cached_at) = chrono::DateTime::parse_from_rfc3339(x) {
-        let age = chrono::Utc::now()
-          .signed_duration_since(cached_at)
-          .num_seconds();
-        if age >= 0 {
-          response_headers.push(("age".into(), age.to_string().into()));
-        }
+      let age = chrono::Utc::now()
+        .signed_duration_since(cached_at)
+        .num_seconds();
+      if age >= 0 {
+        response_headers.push(("age".into(), age.to_string().into()));
       }
     }
 
@@ -247,7 +259,7 @@ impl LscBackend {
 
     let body = http_body_util::BodyDataStream::new(res.into_body())
       .into_stream()
-      .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+      .map_err(std::io::Error::other);
     let body = CacheResponseResource::lsc(body);
 
     Ok(Some((meta, Some(body))))
@@ -289,15 +301,25 @@ impl LscBackend {
     shard.put_object_empty(&object_key, headers).await?;
     Ok(true)
   }
+
+  /// Listing cached request keys is not supported by the remote cache
+  /// backend as it provides no way to enumerate stored objects.
+  pub async fn keys(
+    &self,
+    _cache_id: i64,
+    _request_url: Option<String>,
+  ) -> Result<Vec<CacheKeyEntry>, CacheError> {
+    Err(CacheError::KeysNotSupported)
+  }
 }
 impl deno_core::Resource for LscBackend {
-  fn name(&self) -> std::borrow::Cow<str> {
+  fn name(&self) -> std::borrow::Cow<'_, str> {
     "LscBackend".into()
   }
 }
 
 fn vary_header_matches(
-  vary_header: &[u8],
+  vary_header: &ByteString,
   query_request_headers: &[(ByteString, ByteString)],
   cached_headers: &HeaderMap,
 ) -> bool {
@@ -307,6 +329,9 @@ fn vary_header_matches(
   };
   let headers = get_headers_from_vary_header(vary_header);
   for header in headers {
+    if header == "*" {
+      return false;
+    }
     // Ignoring `accept-encoding` is safe because we refuse to cache responses
     // with `content-encoding`
     if header == "accept-encoding" {
@@ -314,14 +339,22 @@ fn vary_header_matches(
     }
     let lookup_key = format!("{}{}", REQHDR_PREFIX, header);
     let query_header = get_header(&header, query_request_headers);
-    let cached_header = cached_headers.get(&lookup_key);
-    if query_header.as_ref().map(|x| &x[..])
-      != cached_header.as_ref().map(|x| x.as_bytes())
-    {
+    let cached_header = get_header_from_map(&lookup_key, cached_headers);
+    if query_header != cached_header {
       return false;
     }
   }
   true
+}
+
+fn get_header_from_map(name: &str, headers: &HeaderMap) -> Option<ByteString> {
+  let mut values = headers.get_all(name).iter();
+  let mut combined = values.next()?.as_bytes().to_vec();
+  for value in values {
+    combined.extend_from_slice(b", ");
+    combined.extend_from_slice(value.as_bytes());
+  }
+  Some(combined.into())
 }
 
 fn build_cache_object_key(cache_name: &[u8], request_url: &[u8]) -> String {
@@ -330,4 +363,54 @@ fn build_cache_object_key(cache_name: &[u8], request_url: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cache_name),
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(request_url),
   )
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn lsc_vary_header_matches_combined_values() {
+    let mut cached_headers = HeaderMap::new();
+    cached_headers.append(
+      "x-lsc-meta-reqhdr-x-example",
+      HeaderValue::from_static("first"),
+    );
+    cached_headers.append(
+      "x-lsc-meta-reqhdr-x-example",
+      HeaderValue::from_static("cached"),
+    );
+
+    let query_headers = vec![
+      ("X-Example".into(), "first".into()),
+      ("x-example".into(), "cached".into()),
+    ];
+    assert!(vary_header_matches(
+      &"x-example".into(),
+      &query_headers,
+      &cached_headers,
+    ));
+
+    let query_headers = vec![
+      ("x-example".into(), "first".into()),
+      ("x-example".into(), "query".into()),
+    ];
+    assert!(!vary_header_matches(
+      &"x-example".into(),
+      &query_headers,
+      &cached_headers,
+    ));
+  }
+
+  #[test]
+  fn lsc_combines_repeated_vary_fields() {
+    let mut headers = HeaderMap::new();
+    headers.append(VARY, HeaderValue::from_static("accept-language"));
+    headers.append(VARY, HeaderValue::from_static("x-example"));
+
+    assert_eq!(
+      get_header_from_map(VARY.as_str(), &headers),
+      Some("accept-language, x-example".into()),
+    );
+  }
 }

@@ -1,7 +1,10 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
-import { core, primordials } from "ext:core/mod.js";
-import {
+(function () {
+const { core, internals, primordials } = __bootstrap;
+const {
+  op_otel_collect_isolate_metrics,
+  op_otel_enable_isolate_metrics,
   op_otel_log,
   op_otel_log_foreign,
   op_otel_metric_attribute3,
@@ -21,14 +24,14 @@ import {
   op_otel_span_attribute3,
   op_otel_span_update_name,
   OtelMeter,
-  OtelSpan,
   OtelTracer,
-} from "ext:core/ops";
-import { Console } from "ext:deno_console/01_console.js";
+} = core.ops;
+const { Console } = core.loadExtScript("ext:deno_web/01_console.js");
 
 const {
   ArrayFrom,
   ArrayIsArray,
+  ArrayPrototypeConcat,
   ArrayPrototypeFilter,
   ArrayPrototypeForEach,
   ArrayPrototypeJoin,
@@ -40,6 +43,8 @@ const {
   ArrayPrototypeSlice,
   DatePrototype,
   DatePrototypeGetTime,
+  decodeURIComponent,
+  encodeURIComponent,
   Error,
   MapPrototypeEntries,
   MapPrototypeKeys,
@@ -54,8 +59,8 @@ const {
   ObjectValues,
   ReflectApply,
   SafeArrayIterator,
-  SafeIterator,
   SafeMap,
+  SafeMapIterator,
   SafePromiseAll,
   SafeRegExp,
   SafeSet,
@@ -67,14 +72,13 @@ const {
   StringPrototypeTrim,
   SymbolFor,
   TypeError,
-  decodeURIComponent,
-  encodeURIComponent,
 } = primordials;
 const { AsyncVariable, getAsyncContext, setAsyncContext } = core;
 
-export let TRACING_ENABLED = false;
-export let METRICS_ENABLED = false;
-export let PROPAGATORS: TextMapPropagator[] = [];
+let TRACING_ENABLED = false;
+let METRICS_ENABLED = false;
+let PROPAGATORS: TextMapPropagator[] = [];
+let ISOLATE_METRICS = false;
 
 // Note: These start at 0 in the JS library,
 // but start at 1 when serialized with JSON.
@@ -125,6 +129,13 @@ interface Attributes {
 }
 
 type SpanAttributes = Attributes;
+
+interface Exception {
+  code?: string | number;
+  message?: string;
+  name?: string;
+  stack?: string;
+}
 
 type TimeInput = [number, number] | number | Date;
 
@@ -188,18 +199,44 @@ function countAttributes(attributes?: Attributes): number {
   return attributes ? ObjectKeys(attributes).length : 0;
 }
 
+const currentSnapshot = getAsyncContext;
+const restoreSnapshot = setAsyncContext;
+
 interface AsyncContextSnapshot {
   __brand: "AsyncContextSnapshot";
 }
 
-export function enterSpan(span: Span): AsyncContextSnapshot | undefined {
-  if (!span.isRecording()) return undefined;
-  const context = (CURRENT.get() ?? ROOT_CONTEXT).setValue(SPAN_KEY, span);
-  return CURRENT.enter(context);
+// A `unique symbol` type requires a direct `Symbol.for()` call, which is what
+// makes `SpanSnapshot` below narrowable. This runs during bootstrap, before any
+// user code, so reaching for the global here is safe.
+// deno-lint-ignore deno-internal/prefer-primordials
+const DID_NOT_ENTER: unique symbol = Symbol.for(
+  "Deno.telemetry.didNotEnterSpan",
+);
+
+/**
+ * The result of {@linkcode enterSpan}: either the async context snapshot taken
+ * before entering, or `DID_NOT_ENTER` if no context was entered. `undefined` is
+ * a valid snapshot (it means "no ambient context"), so the two cases cannot be
+ * told apart by truthiness, so always hand this to {@linkcode exitSpan}.
+ */
+type SpanSnapshot = AsyncContextSnapshot | typeof DID_NOT_ENTER;
+
+function enterSpan(
+  span: Span,
+  context?: Context,
+): SpanSnapshot {
+  if (!span.isRecording()) return DID_NOT_ENTER;
+  const snapshot = currentSnapshot();
+  context = (context ?? CURRENT.get() ?? ROOT_CONTEXT)
+    .setValue(SPAN_KEY, span);
+  CURRENT.enter(context);
+  return snapshot;
 }
 
-export const currentSnapshot = getAsyncContext;
-export const restoreSnapshot = setAsyncContext;
+function exitSpan(snapshot: SpanSnapshot) {
+  if (snapshot !== DID_NOT_ENTER) restoreSnapshot(snapshot);
+}
 
 function isDate(value: unknown): value is Date {
   return ObjectPrototypeIsPrototypeOf(DatePrototype, value);
@@ -222,6 +259,7 @@ interface OtelTracer {
   startSpanForeign(
     parentTraceId: string,
     parentSpanId: string,
+    parentTraceFlags: number,
     name: string,
     spanKind: SpanKind,
     startTime: number | undefined,
@@ -237,10 +275,61 @@ interface OtelSpan {
   addEvent(
     name: string,
     startTime: number,
-    droppedAttributeCount: number,
-  ): void;
+  ): number;
   dropEvent(): void;
   end(endTime: number): void;
+}
+
+enum SpanAttributesLocation {
+  SELF = 0,
+  EVENT = 1,
+  LINK = 2,
+}
+
+function spanAddAttributes(
+  span: OtelSpan,
+  attributesLocation: SpanAttributesLocation,
+  attributesTarget: number,
+  attributes: Attributes,
+) {
+  const attributeKvs = ObjectEntries(attributes);
+  let i = 0;
+  while (i < attributeKvs.length) {
+    if (i + 2 < attributeKvs.length) {
+      op_otel_span_attribute3(
+        span,
+        attributesLocation,
+        attributesTarget,
+        attributeKvs[i][0],
+        attributeKvs[i][1],
+        attributeKvs[i + 1][0],
+        attributeKvs[i + 1][1],
+        attributeKvs[i + 2][0],
+        attributeKvs[i + 2][1],
+      );
+      i += 3;
+    } else if (i + 1 < attributeKvs.length) {
+      op_otel_span_attribute2(
+        span,
+        attributesLocation,
+        attributesTarget,
+        attributeKvs[i][0],
+        attributeKvs[i][1],
+        attributeKvs[i + 1][0],
+        attributeKvs[i + 1][1],
+      );
+      i += 2;
+    } else {
+      op_otel_span_attribute1(
+        span,
+        attributesLocation,
+        attributesTarget,
+        attributeKvs[i][0],
+        attributeKvs[i][1],
+      );
+      i += 1;
+    }
+  }
 }
 
 interface TracerOptions {
@@ -351,6 +440,7 @@ class Tracer {
       otelSpan = this.#tracer.startSpanForeign(
         spanContext.traceId,
         spanContext.spanId,
+        spanContext.traceFlags ?? 0,
         name,
         options?.kind ?? 0,
         startTime,
@@ -373,7 +463,6 @@ class Span {
   #spanContext: SpanContext | undefined;
 
   static {
-    // deno-lint-ignore prefer-primordials
     getOtelSpan = (span) => (#otelSpan in span ? span.#otelSpan : undefined);
   }
 
@@ -401,32 +490,48 @@ class Span {
     attributesOrStartTime?: Attributes | TimeInput,
     startTime?: TimeInput,
   ): this {
+    if (!this.#otelSpan) return this;
+    let attributes: Attributes | undefined;
     if (isTimeInput(attributesOrStartTime)) {
       startTime = attributesOrStartTime;
-      attributesOrStartTime = undefined;
+    } else {
+      attributes = attributesOrStartTime;
     }
     const startTimeMs = timeInputToMs(startTime);
 
-    this.#otelSpan?.addEvent(
+    const attributesTarget = this.#otelSpan.addEvent(
       name,
       startTimeMs ?? NaN,
-      countAttributes(attributesOrStartTime),
     );
+    if (attributes && attributesTarget !== 0) {
+      spanAddAttributes(
+        this.#otelSpan,
+        SpanAttributesLocation.EVENT,
+        attributesTarget,
+        attributes,
+      );
+    }
     return this;
   }
 
   addLink(link: Link): this {
-    const droppedAttributeCount = (link.droppedAttributesCount ?? 0) +
-      countAttributes(link.attributes);
-    const valid = op_otel_span_add_link(
+    if (!this.#otelSpan) return this;
+    const attributesTarget = op_otel_span_add_link(
       this.#otelSpan,
       link.context.traceId,
       link.context.spanId,
       link.context.traceFlags,
       link.context.isRemote ?? false,
-      droppedAttributeCount,
+      link.droppedAttributesCount ?? 0,
     );
-    if (!valid) return this;
+    if (link.attributes && attributesTarget !== 0) {
+      spanAddAttributes(
+        this.#otelSpan,
+        SpanAttributesLocation.LINK,
+        attributesTarget,
+        link.attributes,
+      );
+    }
     return this;
   }
 
@@ -445,51 +550,55 @@ class Span {
     return this.#otelSpan !== undefined;
   }
 
-  // deno-lint-ignore no-explicit-any
-  recordException(_exception: any, _time?: TimeInput): void {
-    this.#otelSpan?.dropEvent();
+  recordException(exception: string | Exception, time?: TimeInput): void {
+    if (typeof exception === "string") {
+      this.addEvent("exception", {
+        "exception.message": exception,
+      }, time);
+      return;
+    }
+    const attributes: Attributes = {};
+
+    if (exception.code) {
+      if (typeof exception.code === "number") {
+        attributes["exception.type"] = NumberPrototypeToString(exception.code);
+      } else {
+        attributes["exception.type"] = exception.code;
+      }
+    } else if (exception.name) {
+      attributes["exception.type"] = exception.name;
+    }
+
+    if (exception.message) {
+      attributes["exception.message"] = exception.message;
+    }
+    if (exception.stack) {
+      attributes["exception.stacktrace"] = exception.stack;
+    }
+
+    this.addEvent("exception", attributes, time);
   }
 
   setAttribute(key: string, value: AttributeValue): this {
     if (!this.#otelSpan) return this;
-    op_otel_span_attribute1(this.#otelSpan, key, value);
+    op_otel_span_attribute1(
+      this.#otelSpan,
+      SpanAttributesLocation.SELF,
+      0,
+      key,
+      value,
+    );
     return this;
   }
 
   setAttributes(attributes: Attributes): this {
     if (!this.#otelSpan) return this;
-    const attributeKvs = ObjectEntries(attributes);
-    let i = 0;
-    while (i < attributeKvs.length) {
-      if (i + 2 < attributeKvs.length) {
-        op_otel_span_attribute3(
-          this.#otelSpan,
-          attributeKvs[i][0],
-          attributeKvs[i][1],
-          attributeKvs[i + 1][0],
-          attributeKvs[i + 1][1],
-          attributeKvs[i + 2][0],
-          attributeKvs[i + 2][1],
-        );
-        i += 3;
-      } else if (i + 1 < attributeKvs.length) {
-        op_otel_span_attribute2(
-          this.#otelSpan,
-          attributeKvs[i][0],
-          attributeKvs[i][1],
-          attributeKvs[i + 1][0],
-          attributeKvs[i + 1][1],
-        );
-        i += 2;
-      } else {
-        op_otel_span_attribute1(
-          this.#otelSpan,
-          attributeKvs[i][0],
-          attributeKvs[i][1],
-        );
-        i += 1;
-      }
-    }
+    spanAddAttributes(
+      this.#otelSpan,
+      SpanAttributesLocation.SELF,
+      0,
+      attributes,
+    );
     return this;
   }
 
@@ -537,7 +646,7 @@ class Context {
 const ROOT_CONTEXT = new Context();
 
 // Context manager for opentelemetry js library
-export class ContextManager {
+class ContextManager {
   constructor() {
     throw new TypeError("ContextManager can not be constructed");
   }
@@ -678,7 +787,7 @@ class BatchObservableResult {
 
   static {
     batchResultHasObservables = (cb, observables) => {
-      for (const observable of new SafeIterator(observables)) {
+      for (const observable of new SafeArrayIterator(observables)) {
         if (!cb.#observables.has(observable)) return false;
       }
       return true;
@@ -715,7 +824,7 @@ class Meter {
     if (!METRICS_ENABLED) return new Counter(null, false);
     const instrument = this.#meter.createCounter(
       name,
-      // deno-lint-ignore prefer-primordials
+      // deno-lint-ignore deno-internal/prefer-primordials
       options?.description,
       options?.unit,
     ) as Instrument;
@@ -729,7 +838,7 @@ class Meter {
     if (!METRICS_ENABLED) return new Counter(null, true);
     const instrument = this.#meter.createUpDownCounter(
       name,
-      // deno-lint-ignore prefer-primordials
+      // deno-lint-ignore deno-internal/prefer-primordials
       options?.description,
       options?.unit,
     ) as Instrument;
@@ -743,7 +852,7 @@ class Meter {
     if (!METRICS_ENABLED) return new Gauge(null);
     const instrument = this.#meter.createGauge(
       name,
-      // deno-lint-ignore prefer-primordials
+      // deno-lint-ignore deno-internal/prefer-primordials
       options?.description,
       options?.unit,
     ) as Instrument;
@@ -757,7 +866,7 @@ class Meter {
     if (!METRICS_ENABLED) return new Histogram(null);
     const instrument = this.#meter.createHistogram(
       name,
-      // deno-lint-ignore prefer-primordials
+      // deno-lint-ignore deno-internal/prefer-primordials
       options?.description,
       options?.unit,
       options?.advice?.explicitBucketBoundaries,
@@ -772,7 +881,7 @@ class Meter {
     if (!METRICS_ENABLED) new Observable(new ObservableResult(null, true));
     const instrument = this.#meter.createObservableCounter(
       name,
-      // deno-lint-ignore prefer-primordials
+      // deno-lint-ignore deno-internal/prefer-primordials
       options?.description,
       options?.unit,
     ) as Instrument;
@@ -789,7 +898,7 @@ class Meter {
     if (!METRICS_ENABLED) new Observable(new ObservableResult(null, false));
     const instrument = this.#meter.createObservableUpDownCounter(
       name,
-      // deno-lint-ignore prefer-primordials
+      // deno-lint-ignore deno-internal/prefer-primordials
       options?.description,
       options?.unit,
     ) as Instrument;
@@ -803,7 +912,7 @@ class Meter {
     if (!METRICS_ENABLED) new Observable(new ObservableResult(null, false));
     const instrument = this.#meter.createObservableGauge(
       name,
-      // deno-lint-ignore prefer-primordials
+      // deno-lint-ignore deno-internal/prefer-primordials
       options?.description,
       options?.unit,
     ) as Instrument;
@@ -854,8 +963,7 @@ function record(
       const remaining = attrs.length - i;
       if (remaining > 3) {
         op_otel_metric_attribute3(
-          instrument,
-          value,
+          attrs.length,
           attrs[i][0],
           attrs[i][1],
           attrs[i + 1][0],
@@ -912,8 +1020,7 @@ function recordObservable(
       const remaining = attrs.length - i;
       if (remaining > 3) {
         op_otel_metric_attribute3(
-          instrument,
-          value,
+          attrs.length,
           attrs[i][0],
           attrs[i][1],
           attrs[i + 1][0],
@@ -1061,24 +1168,28 @@ class ObservableResult {
 }
 
 async function observe(): Promise<void> {
+  if (ISOLATE_METRICS) {
+    op_otel_collect_isolate_metrics();
+  }
+
   const promises: Promise<void>[] = [];
   // Primordials are not needed, because this is a SafeMap.
-  // deno-lint-ignore prefer-primordials
+  // deno-lint-ignore deno-internal/prefer-primordials
   for (const { 0: observable, 1: callbacks } of INDIVIDUAL_CALLBACKS) {
     const result = getObservableResult(observable);
     // Primordials are not needed, because this is a SafeSet.
-    // deno-lint-ignore prefer-primordials
+    // deno-lint-ignore deno-internal/prefer-primordials
     for (const callback of callbacks) {
       // PromiseTry is not in primordials?
-      // deno-lint-ignore prefer-primordials
+      // deno-lint-ignore deno-internal/prefer-primordials
       ArrayPrototypePush(promises, Promise.try(callback, result));
     }
   }
   // Primordials are not needed, because this is a SafeMap.
-  // deno-lint-ignore prefer-primordials
+  // deno-lint-ignore deno-internal/prefer-primordials
   for (const { 0: callback, 1: result } of BATCH_CALLBACKS) {
     // PromiseTry is not in primordials?
-    // deno-lint-ignore prefer-primordials
+    // deno-lint-ignore deno-internal/prefer-primordials
     ArrayPrototypePush(promises, Promise.try(callback, result));
   }
   await SafePromiseAll(promises);
@@ -1107,13 +1218,35 @@ const otelConsoleConfig = {
   replace: 2,
 };
 
+let pendingException: Error | undefined;
+
+const OTEL_CONSOLE_METHODS = ["log", "debug", "info", "warn", "error"];
+
+function wrapOtelConsoleMethods(otelConsole: Console) {
+  for (let i = 0; i < OTEL_CONSOLE_METHODS.length; i++) {
+    const method = OTEL_CONSOLE_METHODS[i];
+    const orig = otelConsole[method];
+    otelConsole[method] = (...args: unknown[]) => {
+      if (args.length >= 1 && core.isNativeError(args[0])) {
+        pendingException = args[0] as Error;
+      }
+      return ReflectApply(orig, otelConsole, args);
+    };
+  }
+}
+
 function otelLog(message: string, level: number) {
+  const exception = pendingException;
+  pendingException = undefined;
+  const excType = exception?.name ?? "";
+  const excMessage = exception?.message ?? "";
+  const excStacktrace = exception?.stack ?? "";
   const currentSpan = CURRENT.get()?.getValue(SPAN_KEY);
   const otelSpan = currentSpan !== undefined
     ? getOtelSpan(currentSpan)
     : undefined;
   if (otelSpan || currentSpan === undefined) {
-    op_otel_log(message, level, otelSpan);
+    op_otel_log(message, level, otelSpan, excType, excMessage, excStacktrace);
   } else {
     const spanContext = currentSpan.spanContext();
     op_otel_log_foreign(
@@ -1122,6 +1255,9 @@ function otelLog(message: string, level: number) {
       spanContext.traceId,
       spanContext.spanId,
       spanContext.traceFlags,
+      excType,
+      excMessage,
+      excStacktrace,
     );
   }
 }
@@ -1483,7 +1619,7 @@ interface Baggage {
   clear(): Baggage;
 }
 
-export function baggageEntryMetadataFromString(
+function baggageEntryMetadataFromString(
   str: string,
 ): BaggageEntryMetadata {
   if (typeof str !== "string") {
@@ -1517,7 +1653,7 @@ function getKeyPairs(baggage: Baggage): string[] {
     // NOTE: we intentionally don't URI-encode the metadata - that responsibility falls on the metadata implementation
     if (baggageEntry[1].metadata !== undefined) {
       entry += BAGGAGE_PROPERTIES_SEPARATOR +
-        // deno-lint-ignore prefer-primordials
+        // deno-lint-ignore deno-internal/prefer-primordials
         baggageEntry[1].metadata.toString();
     }
 
@@ -1560,7 +1696,13 @@ class BaggageImpl implements Baggage {
   #entries: Map<string, BaggageEntry>;
 
   constructor(entries?: Map<string, BaggageEntry>) {
-    this.#entries = entries ? new SafeMap(entries) : new SafeMap();
+    this.#entries = new SafeMap();
+    // The `SafeMap` constructor that takes an iterable doesn't work for non Array iterables correctly.
+    if (entries) {
+      for (const { 0: key, 1: entry } of new SafeMapIterator(entries)) {
+        this.#entries.set(key, ObjectAssign({}, entry));
+      }
+    }
   }
 
   getEntry(key: string): BaggageEntry | undefined {
@@ -1604,9 +1746,11 @@ class BaggageImpl implements Baggage {
   }
 }
 
-export class W3CBaggagePropagator implements TextMapPropagator {
+const BAGGAGE_KEY = SymbolFor("OpenTelemetry Baggage Key");
+
+class W3CBaggagePropagator implements TextMapPropagator {
   inject(context: Context, carrier: unknown, setter: TextMapSetter): void {
-    const baggage = context.getValue(baggageEntryMetadataSymbol) as
+    const baggage = context.getValue(BAGGAGE_KEY) as
       | Baggage
       | undefined;
     if (!baggage || isTracingSuppressed(context)) return;
@@ -1630,9 +1774,6 @@ export class W3CBaggagePropagator implements TextMapPropagator {
       : headerValue;
     if (!baggageString) return context;
     const baggage: Record<string, BaggageEntry> = {};
-    if (baggageString.length === 0) {
-      return context;
-    }
     const pairs = StringPrototypeSplit(baggageString, BAGGAGE_ITEMS_SEPARATOR);
     ArrayPrototypeForEach(pairs, (entry) => {
       const keyPair = parsePairKeyValue(entry);
@@ -1649,7 +1790,7 @@ export class W3CBaggagePropagator implements TextMapPropagator {
     }
 
     return context.setValue(
-      baggageEntryMetadataSymbol,
+      BAGGAGE_KEY,
       new BaggageImpl(new SafeMap(ObjectEntries(baggage))),
     );
   }
@@ -1659,13 +1800,73 @@ export class W3CBaggagePropagator implements TextMapPropagator {
   }
 }
 
+class CompositePropagator implements TextMapPropagator {
+  #propagators: TextMapPropagator[];
+  #fields: string[];
+
+  constructor(propagators: TextMapPropagator[]) {
+    this.#propagators = propagators;
+    this.#fields = ArrayFrom(
+      new SafeSet(
+        ArrayPrototypeReduce(
+          ArrayPrototypeMap(
+            this.#propagators,
+            (p) => p.fields(),
+          ),
+          (x, y) => ArrayPrototypeConcat(x, y),
+          [],
+        ),
+      ),
+    );
+  }
+
+  inject(context: Context, carrier: unknown, setter: TextMapSetter): void {
+    for (const propagator of new SafeArrayIterator(this.#propagators)) {
+      try {
+        propagator.inject(context, carrier, setter);
+      } catch (err) {
+        // deno-lint-ignore no-console
+        console.warn(
+          `Failed to inject with ${propagator.constructor.name}.`,
+          err,
+        );
+      }
+    }
+  }
+
+  extract(context: Context, carrier: unknown, getter: TextMapGetter): Context {
+    return ArrayPrototypeReduce(this.#propagators, (ctx, propagator) => {
+      try {
+        return propagator.extract(ctx, carrier, getter);
+      } catch (err) {
+        // deno-lint-ignore no-console
+        console.warn(
+          `Failed to extract with ${propagator.constructor.name}.`,
+          err,
+        );
+      }
+      return ctx;
+    }, context);
+  }
+
+  fields(): string[] {
+    return ArrayPrototypeSlice(this.#fields);
+  }
+}
+
 let builtinTracerCache: Tracer;
 
-export function builtinTracer(): Tracer {
+function builtinTracer(): Tracer {
   if (!builtinTracerCache) {
     builtinTracerCache = new Tracer(OtelTracer.builtin());
   }
   return builtinTracerCache;
+}
+
+function enableIsolateMetrics() {
+  op_otel_enable_isolate_metrics();
+  ISOLATE_METRICS = true;
+  startObserving();
 }
 
 // We specify a very high version number, to allow any `@opentelemetry/api`
@@ -1673,12 +1874,11 @@ export function builtinTracer(): Tracer {
 // able to register anything itself with the global registration methods.
 const OTEL_API_COMPAT_VERSION = "1.999.999";
 
-export function bootstrap(
+function bootstrap(
   config: [
     0 | 1,
     0 | 1,
     (typeof otelConsoleConfig)[keyof typeof otelConsoleConfig],
-    0 | 1,
     ...Array<(typeof otelPropagators)[keyof typeof otelPropagators]>,
   ],
 ): void {
@@ -1708,21 +1908,27 @@ export function bootstrap(
   );
 
   switch (consoleConfig) {
-    case otelConsoleConfig.capture:
-      core.wrapConsole(globalThis.console, new Console(otelLog));
+    case otelConsoleConfig.capture: {
+      const otelConsole = new Console(otelLog);
+      wrapOtelConsoleMethods(otelConsole);
+      core.wrapConsole(globalThis.console, otelConsole);
       break;
-    case otelConsoleConfig.replace:
+    }
+    case otelConsoleConfig.replace: {
+      const otelConsole = new Console(otelLog);
+      wrapOtelConsoleMethods(otelConsole);
       ObjectDefineProperty(
         globalThis,
         "console",
-        core.propNonEnumerable(new Console(otelLog)),
+        core.propNonEnumerable(otelConsole),
       );
       break;
+    }
     default:
       break;
   }
 
-  if (TRACING_ENABLED || METRICS_ENABLED) {
+  if (TRACING_ENABLED || METRICS_ENABLED || PROPAGATORS.length > 0) {
     const otel = globalThis[SymbolFor("opentelemetry.js.api.1")] ??= {
       version: OTEL_API_COMPAT_VERSION,
     };
@@ -1732,12 +1938,72 @@ export function bootstrap(
     }
     if (METRICS_ENABLED) {
       otel.metrics = MeterProvider;
+      enableIsolateMetrics();
+    }
+    if (PROPAGATORS.length > 0) {
+      otel.propagation = new CompositePropagator(PROPAGATORS);
     }
   }
 }
 
-export const telemetry = {
+internals.__telemetry = {
+  builtinTracer,
+  ContextManager,
+  DID_NOT_ENTER,
+  enterSpan,
+  exitSpan,
+  get PROPAGATORS() {
+    return PROPAGATORS;
+  },
+  restoreSnapshot,
+  get TRACING_ENABLED() {
+    return TRACING_ENABLED;
+  },
+};
+
+const telemetry = {
   tracerProvider: TracerProvider,
   contextManager: ContextManager,
   meterProvider: MeterProvider,
 };
+
+// Mutable state container: consumers destructure a reference to this
+// object, so property access at call-time always reflects the latest
+// values set by bootstrap().
+const otelState = {
+  TRACING_ENABLED: false,
+  METRICS_ENABLED: false,
+  PROPAGATORS: [] as TextMapPropagator[],
+  getOtelSpan: undefined as
+    | ((span: object) => OtelSpan | null | undefined)
+    | undefined,
+};
+
+// Keep module-level variables in sync with otelState for internal use
+// (existing code references the bare names).
+const _origBootstrap = bootstrap;
+function wrappedBootstrap(config: Parameters<typeof bootstrap>[0]) {
+  _origBootstrap(config);
+  otelState.TRACING_ENABLED = TRACING_ENABLED;
+  otelState.METRICS_ENABLED = METRICS_ENABLED;
+  otelState.PROPAGATORS = PROPAGATORS;
+  otelState.getOtelSpan = getOtelSpan;
+}
+
+return {
+  otelState,
+  enterSpan,
+  exitSpan,
+  currentSnapshot,
+  restoreSnapshot,
+  SPAN_KEY,
+  Span,
+  ContextManager,
+  baggageEntryMetadataFromString,
+  W3CBaggagePropagator,
+  CompositePropagator,
+  builtinTracer,
+  bootstrap: wrappedBootstrap,
+  telemetry,
+};
+})();

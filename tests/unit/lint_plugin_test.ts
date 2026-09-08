@@ -1,6 +1,6 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
-import { assertEquals } from "./test_util.ts";
+import { assert, assertEquals, assertStringIncludes } from "./test_util.ts";
 import { assertSnapshot } from "@std/testing/snapshot";
 
 // TODO(@marvinhagemeister) Remove once we land "official" types
@@ -442,6 +442,22 @@ Deno.test("Plugin - visitor :not", () => {
   );
   assertEquals(result[0].node.type, "Identifier");
   assertEquals(result[0].node.name, "bar");
+});
+
+Deno.test("Plugin - parent", () => {
+  let parent: Deno.lint.Node | undefined;
+
+  testPlugin("const foo = 1;", {
+    create() {
+      return {
+        VariableDeclaration(node) {
+          parent = node.parent;
+        },
+      };
+    },
+  });
+
+  assertEquals(parent?.type, "Program");
 });
 
 Deno.test("Plugin - Program", async (t) => {
@@ -905,6 +921,44 @@ Deno.test("Plugin - Abstract class", async (t) => {
   );
 });
 
+Deno.test("Plugin - Decorators", async (t) => {
+  // Class declaration
+  await testSnapshot(
+    t,
+    `@deco class Foo {}`,
+    "ClassDeclaration",
+  );
+
+  // Class expression
+  await testSnapshot(
+    t,
+    `let foo = class Foo { @deco foo() {} }`,
+    "ClassExpression",
+  );
+
+  // Other
+  await testSnapshot(
+    t,
+    `class Foo { @deco foobar() {} }`,
+    "MethodDefinition",
+  );
+  await testSnapshot(
+    t,
+    `class Foo { @deco get foo() { return 2 } }`,
+    "MethodDefinition",
+  );
+  await testSnapshot(
+    t,
+    `class Foo { @deco("arg") foo: string; constructor() { this.foo = "foo" } }`,
+    "ClassDeclaration",
+  );
+  await testSnapshot(
+    t,
+    `class Foo { foo(@deco foo: string) {} }`,
+    "ClassDeclaration",
+  );
+});
+
 Deno.test("Plugin - JSXElement + JSXOpeningElement + JSXClosingElement + JSXAttr", async (t) => {
   await testSnapshot(t, "<div />", "JSXElement");
   await testSnapshot(t, "<div></div>", "JSXElement");
@@ -1173,4 +1227,47 @@ Deno.test("Plugin - TS keywords", async (t) => {
   await testSnapshot(t, "type A = undefined", "TSUndefinedKeyword");
   await testSnapshot(t, "type A = unknown", "TSUnknownKeyword");
   await testSnapshot(t, "type A = void", "TSVoidKeyword");
+});
+
+Deno.test("Plugin - enumerable properties", () => {
+  const keys: string[] = [];
+  testPlugin(`const a = 42`, {
+    create() {
+      return {
+        Program(node) {
+          // deno-lint-ignore guard-for-in
+          for (const k in node) {
+            keys.push(k);
+          }
+        },
+      };
+    },
+  });
+
+  assert(keys.length > 0);
+});
+
+Deno.test("Plugin - error when reported range start > end", () => {
+  // assertThrows doesn't support checking the error message.
+  try {
+    testPlugin(`foo;`, {
+      create(ctx) {
+        return {
+          Identifier(node) {
+            ctx.report({
+              message: "not ok",
+              range: node.range.reverse() as Deno.lint.Range,
+            });
+          },
+        };
+      },
+    });
+    throw new Error("fail");
+  } catch (err) {
+    if (!(err instanceof Error)) {
+      throw err;
+    }
+
+    assertStringIncludes((err.cause as Error).message, "Invalid range");
+  }
 });

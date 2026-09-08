@@ -1,9 +1,9 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
-use std::net::IpAddr;
 use std::str::FromStr;
 
-use deno_core::url::Url;
+use deno_cli_parser::CliError;
+use deno_cli_parser::CliErrorKind;
 use deno_runtime::deno_permissions::NetDescriptor;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -28,21 +28,10 @@ impl FromStr for BarePort {
   }
 }
 
-pub fn validator(host_and_port: &str) -> Result<String, String> {
-  if Url::parse(&format!("internal://{host_and_port}")).is_ok()
-    || host_and_port.parse::<IpAddr>().is_ok()
-    || host_and_port.parse::<BarePort>().is_ok()
-  {
-    Ok(host_and_port.to_string())
-  } else {
-    Err(format!("Bad host:port pair: {host_and_port}"))
-  }
-}
-
 /// Expands "bare port" paths (eg. ":8080") into full paths with hosts. It
 /// expands to such paths into 3 paths with following hosts: `0.0.0.0:port`,
 /// `127.0.0.1:port` and `localhost:port`.
-pub fn parse(paths: Vec<String>) -> clap::error::Result<Vec<String>> {
+pub fn parse(paths: Vec<String>) -> Result<Vec<String>, CliError> {
   let mut out: Vec<String> = vec![];
   for host_and_port in paths.into_iter() {
     if let Ok(port) = host_and_port.parse::<BarePort>() {
@@ -51,8 +40,8 @@ pub fn parse(paths: Vec<String>) -> clap::error::Result<Vec<String>> {
         out.push(format!("{}:{}", host, port.0));
       }
     } else {
-      NetDescriptor::parse(&host_and_port).map_err(|e| {
-        clap::Error::raw(clap::error::ErrorKind::InvalidValue, e.to_string())
+      NetDescriptor::parse_for_list(&host_and_port).map_err(|e| {
+        CliError::new(CliErrorKind::InvalidValue, e.to_string())
       })?;
       out.push(host_and_port)
     }
@@ -119,6 +108,7 @@ mod tests {
     let entries = svec![
       "deno.land",
       "deno.land:80",
+      "*.deno.land",
       "[::]",
       "[::1]",
       "127.0.0.1",
@@ -135,11 +125,15 @@ mod tests {
       "localhost:8000",
       "0.0.0.0:4545",
       "127.0.0.1:4545",
-      "999.0.88.1:80"
+      "999.0.88.1:80",
+      "127.0.0.0/24",
+      "192.168.1.0/24",
+      "10.0.0.0/8"
     ];
     let expected = svec![
       "deno.land",
       "deno.land:80",
+      "*.deno.land",
       "[::]",
       "[::1]",
       "127.0.0.1",
@@ -156,7 +150,10 @@ mod tests {
       "localhost:8000",
       "0.0.0.0:4545",
       "127.0.0.1:4545",
-      "999.0.88.1:80"
+      "999.0.88.1:80",
+      "127.0.0.0/24",
+      "192.168.1.0/24",
+      "10.0.0.0/8"
     ];
     let actual = parse(entries).unwrap();
     assert_eq!(actual, expected);
@@ -168,6 +165,43 @@ mod tests {
     let expected = svec!["0.0.0.0:8080", "127.0.0.1:8080", "localhost:8080"];
     let actual = parse(entries).unwrap();
     assert_eq!(actual, expected);
+  }
+
+  #[test]
+  fn parse_net_args_unix_socket() {
+    let entries = svec!["unix:/var/run/docker.sock"];
+    let expected = svec!["unix:/var/run/docker.sock"];
+    let actual = parse(entries).unwrap();
+    assert_eq!(actual, expected);
+  }
+
+  #[test]
+  fn parse_net_args_unix_socket_relative_error() {
+    assert!(parse(svec!["unix:relative.sock"]).is_err());
+    assert!(parse(svec!["unix:"]).is_err());
+  }
+
+  #[cfg(windows)]
+  #[test]
+  fn parse_net_args_windows_named_pipe() {
+    let entries = svec![r"unix:\\.\pipe\app"];
+    let expected = svec![r"unix:\\.\pipe\app"];
+    let actual = parse(entries).unwrap();
+    assert_eq!(actual, expected);
+  }
+
+  #[test]
+  fn parse_net_args_drive_letter_unix_socket() {
+    let entries = svec![r"unix:C:\sockets\app.sock"];
+    #[cfg(windows)]
+    {
+      let actual = parse(entries).unwrap();
+      assert_eq!(actual, svec![r"unix:C:\sockets\app.sock"]);
+    }
+    #[cfg(not(windows))]
+    {
+      assert!(parse(entries).is_err());
+    }
   }
 
   #[test]

@@ -1,4 +1,4 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 import {
   assert,
   assertEquals,
@@ -245,6 +245,25 @@ Deno.test(function textDecoderSharedInt32Array() {
   assertEquals(actual, "ABCDEFGH");
 });
 
+Deno.test(function textDecoderSharedOffsetView() {
+  const ab = new SharedArrayBuffer(6);
+  const dataView = new DataView(ab);
+  const charCodeA = "A".charCodeAt(0);
+  for (let i = 0; i < ab.byteLength; i++) {
+    dataView.setUint8(i, charCodeA + i);
+  }
+  // A byteOffset/byteLength view over shared memory must be snapshotted from
+  // the selected range only.
+  assertEquals(new TextDecoder().decode(new Uint8Array(ab, 2, 2)), "CD");
+  assertEquals(new TextDecoder().decode(new DataView(ab, 1, 3)), "BCD");
+});
+
+Deno.test(function textDecoderSharedMultibyte() {
+  const ab = new SharedArrayBuffer(2);
+  new Uint8Array(ab).set([0xc2, 0xa9]); // UTF-8 "©"
+  assertEquals(new TextDecoder().decode(new Uint8Array(ab)), "©");
+});
+
 Deno.test(function toStringShouldBeWebCompatibility() {
   const encoder = new TextEncoder();
   assertEquals(encoder.toString(), "[object TextEncoder]");
@@ -322,5 +341,58 @@ Deno.test(
     assertEquals(chunks.length, 1);
     assertEquals(chunks[0].length, 12);
     assertStrictEquals(cancelled, true);
+  },
+);
+
+Deno.test(
+  "TextDecoder should handle empty chunk in stream mode (legacy encodings)",
+  () => {
+    // big5: [0xa4, 0xa4] => "中" (U+4E2D)
+    {
+      const u8 = new Uint8Array([0xa4, 0xa4]);
+      const str = new TextDecoder("big5").decode(u8);
+      assertEquals(str, "\u4e2d");
+
+      const d = new TextDecoder("big5");
+      const chunks = [
+        d.decode(u8.subarray(0, 1), { stream: true }),
+        d.decode(u8.subarray(1), { stream: true }),
+        d.decode(new Uint8Array(), { stream: true }),
+        d.decode(),
+      ];
+      assertEquals(chunks.join(""), str);
+    }
+
+    // shift_jis: [0x82, 0xa0] => "あ" (U+3042)
+    {
+      const u8 = new Uint8Array([0x82, 0xa0]);
+      const str = new TextDecoder("shift_jis").decode(u8);
+      assertEquals(str, "\u3042");
+
+      const d = new TextDecoder("shift_jis");
+      const chunks = [
+        d.decode(u8.subarray(0, 1), { stream: true }),
+        d.decode(u8.subarray(1), { stream: true }),
+        d.decode(new Uint8Array(), { stream: true }),
+        d.decode(),
+      ];
+      assertEquals(chunks.join(""), str);
+    }
+
+    // euc-kr: [0xb0, 0xa1] => "가" (U+AC00)
+    {
+      const u8 = new Uint8Array([0xb0, 0xa1]);
+      const str = new TextDecoder("euc-kr").decode(u8);
+      assertEquals(str, "\uac00");
+
+      const d = new TextDecoder("euc-kr");
+      const chunks = [
+        d.decode(u8.subarray(0, 1), { stream: true }),
+        d.decode(u8.subarray(1), { stream: true }),
+        d.decode(new Uint8Array(), { stream: true }),
+        d.decode(),
+      ];
+      assertEquals(chunks.join(""), str);
+    }
   },
 );

@@ -1,4 +1,4 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 // @ts-check
 /// <reference path="../../core/internal.d.ts" />
@@ -6,7 +6,8 @@
 /// <reference path="../web/internal.d.ts" />
 /// <reference path="../../cli/tsc/dts/lib.deno_web.d.ts" />
 
-import { primordials } from "ext:core/mod.js";
+(function () {
+const { core, primordials } = __bootstrap;
 const {
   ArrayPrototypeIncludes,
   MapPrototypeGet,
@@ -24,7 +25,7 @@ const {
   TypedArrayPrototypeIncludes,
 } = primordials;
 
-import {
+const {
   assert,
   collectHttpQuotedString,
   collectSequenceOfCodepoints,
@@ -33,7 +34,7 @@ import {
   HTTP_WHITESPACE,
   HTTP_WHITESPACE_PREFIX_RE,
   HTTP_WHITESPACE_SUFFIX_RE,
-} from "./00_infra.js";
+} = core.loadExtScript("ext:deno_web/00_infra.js");
 
 /**
  * @typedef MimeType
@@ -421,22 +422,19 @@ function imageTypePatternMatchingAlgorithm(input) {
 
 /**
  * Ref: https://mimesniff.spec.whatwg.org/#rules-for-sniffing-images-specifically
- * @param {string} mimeTypeString
- * @returns {string}
+ * @param {string | null} mimeTypeString
+ * @param {Uint8Array} byteSequence
+ * @returns {string | null}
  */
-function sniffImage(mimeTypeString) {
-  const mimeType = parseMimeType(mimeTypeString);
-  if (mimeType === null) {
+function sniffImage(mimeTypeString, byteSequence) {
+  // NOTE: Do we need to implement the "supplied MIME type" detection exactly?
+  // https://mimesniff.spec.whatwg.org/#supplied-mime-type-detection-algorithm
+
+  if (mimeTypeString !== null && isXML(mimeTypeString)) {
     return mimeTypeString;
   }
 
-  if (isXML(mimeType)) {
-    return mimeTypeString;
-  }
-
-  const imageTypeMatched = imageTypePatternMatchingAlgorithm(
-    new TextEncoder().encode(mimeTypeString),
-  );
+  const imageTypeMatched = imageTypePatternMatchingAlgorithm(byteSequence);
   if (imageTypeMatched !== undefined) {
     return imageTypeMatched;
   }
@@ -444,10 +442,11 @@ function sniffImage(mimeTypeString) {
   return mimeTypeString;
 }
 
-export {
+return {
   essence,
   extractMimeType,
   parseMimeType,
   serializeMimeType,
   sniffImage,
 };
+})();

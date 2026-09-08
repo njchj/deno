@@ -1,11 +1,8 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::env::current_dir;
-use std::io::ErrorKind;
-use std::marker::PhantomData;
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -14,11 +11,11 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use async_trait::async_trait;
-use deno_core::unsync::spawn_blocking;
 use deno_core::OpState;
+use deno_core::unsync::spawn_blocking;
 use deno_error::JsErrorBox;
-use deno_path_util::normalize_path;
-use deno_permissions::PermissionCheckError;
+use deno_permissions::OpenAccessKind;
+use deno_permissions::PermissionsContainer;
 pub use denokv_sqlite::SqliteBackendError;
 use denokv_sqlite::SqliteConfig;
 use denokv_sqlite::SqliteNotifier;
@@ -30,48 +27,12 @@ use crate::DatabaseHandler;
 static SQLITE_NOTIFIERS_MAP: OnceLock<Mutex<HashMap<PathBuf, SqliteNotifier>>> =
   OnceLock::new();
 
-pub struct SqliteDbHandler<P: SqliteDbHandlerPermissions + 'static> {
+pub struct SqliteDbHandler {
   pub default_storage_dir: Option<PathBuf>,
   versionstamp_rng_seed: Option<u64>,
-  _permissions: PhantomData<P>,
 }
 
-pub trait SqliteDbHandlerPermissions {
-  #[must_use = "the resolved return value to mitigate time-of-check to time-of-use issues"]
-  fn check_read(
-    &mut self,
-    p: &str,
-    api_name: &str,
-  ) -> Result<PathBuf, PermissionCheckError>;
-  #[must_use = "the resolved return value to mitigate time-of-check to time-of-use issues"]
-  fn check_write<'a>(
-    &mut self,
-    p: &'a Path,
-    api_name: &str,
-  ) -> Result<Cow<'a, Path>, PermissionCheckError>;
-}
-
-impl SqliteDbHandlerPermissions for deno_permissions::PermissionsContainer {
-  #[inline(always)]
-  fn check_read(
-    &mut self,
-    p: &str,
-    api_name: &str,
-  ) -> Result<PathBuf, PermissionCheckError> {
-    deno_permissions::PermissionsContainer::check_read(self, p, api_name)
-  }
-
-  #[inline(always)]
-  fn check_write<'a>(
-    &mut self,
-    p: &'a Path,
-    api_name: &str,
-  ) -> Result<Cow<'a, Path>, PermissionCheckError> {
-    deno_permissions::PermissionsContainer::check_write_path(self, p, api_name)
-  }
-}
-
-impl<P: SqliteDbHandlerPermissions> SqliteDbHandler<P> {
+impl SqliteDbHandler {
   pub fn new(
     default_storage_dir: Option<PathBuf>,
     versionstamp_rng_seed: Option<u64>,
@@ -79,7 +40,6 @@ impl<P: SqliteDbHandlerPermissions> SqliteDbHandler<P> {
     Self {
       default_storage_dir,
       versionstamp_rng_seed,
-      _permissions: PhantomData,
     }
   }
 }
@@ -90,8 +50,63 @@ deno_error::js_error_wrapper!(
   "TypeError"
 );
 
+#[derive(Debug)]
+enum Mode {
+  Disk,
+  InMemory,
+}
+
+fn resolve_sqlite_system_path_alias(path: &Path) -> PathBuf {
+  // SQLITE_OPEN_NOFOLLOW rejects symlinks in every path component. macOS
+  // exposes its temporary directories through root-owned aliases, so resolve
+  // only those fixed system prefixes and leave every user-controlled path
+  // component visible to SQLite.
+  #[cfg(target_os = "macos")]
+  for prefix in [Path::new("/var"), Path::new("/tmp")] {
+    if let Ok(suffix) = path.strip_prefix(prefix)
+      && let Ok(prefix) = deno_path_util::fs::canonicalize_path_maybe_not_exists(
+        &sys_traits::impls::RealSys,
+        prefix,
+      )
+    {
+      return prefix.join(suffix);
+    }
+  }
+  path.to_path_buf()
+}
+
+/// SQLite does not enforce `SQLITE_OPEN_NOFOLLOW` on Windows (its
+/// `winFullPathname` never resolves reparse points), so reject symlinks and
+/// junctions in every path component manually before opening.
+#[cfg(windows)]
+fn refuse_reparse_point_components(path: &Path) -> std::io::Result<()> {
+  let mut current = PathBuf::new();
+  for component in path.components() {
+    current.push(component);
+    #[allow(
+      clippy::disallowed_methods,
+      reason = "the database path is always on the real fs"
+    )]
+    match std::fs::symlink_metadata(&current) {
+      Ok(metadata) if metadata.file_type().is_symlink() => {
+        return Err(std::io::Error::new(
+          std::io::ErrorKind::InvalidInput,
+          format!(
+            "unable to open database file: \"{}\" is a symlink",
+            current.display()
+          ),
+        ));
+      }
+      Ok(_) => {}
+      // Missing components are created (or rejected) by SQLite itself.
+      Err(_) => break,
+    }
+  }
+  Ok(())
+}
+
 #[async_trait(?Send)]
-impl<P: SqliteDbHandlerPermissions> DatabaseHandler for SqliteDbHandler<P> {
+impl DatabaseHandler for SqliteDbHandler {
   type DB = denokv_sqlite::Sqlite;
 
   async fn open(
@@ -99,16 +114,21 @@ impl<P: SqliteDbHandlerPermissions> DatabaseHandler for SqliteDbHandler<P> {
     state: Rc<RefCell<OpState>>,
     path: Option<String>,
   ) -> Result<Self::DB, JsErrorBox> {
+    enum PathOrInMemory {
+      InMemory,
+      Path(PathBuf),
+    }
+
     #[must_use = "the resolved return value to mitigate time-of-check to time-of-use issues"]
-    fn validate_path<P: SqliteDbHandlerPermissions + 'static>(
+    fn validate_path(
       state: &RefCell<OpState>,
       path: Option<String>,
-    ) -> Result<Option<String>, JsErrorBox> {
+    ) -> Result<Option<PathOrInMemory>, JsErrorBox> {
       let Some(path) = path else {
         return Ok(None);
       };
       if path == ":memory:" {
-        return Ok(Some(path));
+        return Ok(Some(PathOrInMemory::InMemory));
       }
       if path.is_empty() {
         return Err(JsErrorBox::type_error("Filename cannot be empty"));
@@ -119,44 +139,83 @@ impl<P: SqliteDbHandlerPermissions> DatabaseHandler for SqliteDbHandler<P> {
         ));
       }
       {
-        let mut state = state.borrow_mut();
-        let permissions = state.borrow_mut::<P>();
+        let state = state.borrow();
+        let permissions = state.borrow::<PermissionsContainer>();
         let path = permissions
-          .check_read(&path, "Deno.openKv")
+          .check_open(
+            Cow::Owned(PathBuf::from(path)),
+            OpenAccessKind::ReadWriteNoFollow,
+            Some("Deno.openKv"),
+          )
           .map_err(JsErrorBox::from_err)?;
-        let path = permissions
-          .check_write(&path, "Deno.openKv")
-          .map_err(JsErrorBox::from_err)?;
-        Ok(Some(path.to_string_lossy().to_string()))
+        Ok(Some(PathOrInMemory::Path(
+          resolve_sqlite_system_path_alias(&path),
+        )))
       }
     }
 
-    let path = validate_path::<P>(&state, path)?;
+    let path = validate_path(&state, path)?;
     let default_storage_dir = self.default_storage_dir.clone();
     type ConnGen =
       Arc<dyn Fn() -> rusqlite::Result<rusqlite::Connection> + Send + Sync>;
     let (conn_gen, notifier_key): (ConnGen, _) = spawn_blocking(move || {
-      denokv_sqlite::sqlite_retry_loop(|| {
-        let (conn, notifier_key) = match (path.as_deref(), &default_storage_dir)
+      denokv_sqlite::sqlite_retry_loop(move || {
+        let mode = match std::env::var("DENO_KV_DB_MODE")
+          .unwrap_or_default()
+          .as_str()
         {
-          (Some(":memory:"), _) | (None, None) => (
+          "disk" | "" => Mode::Disk,
+          "memory" => Mode::InMemory,
+          _ => {
+            log::warn!("Unknown DENO_KV_DB_MODE value, defaulting to disk");
+            Mode::Disk
+          }
+        };
+
+        if matches!(mode, Mode::InMemory) {
+          return Ok::<_, SqliteBackendError>((
+            Arc::new(rusqlite::Connection::open_in_memory) as ConnGen,
+            None,
+          ));
+        }
+
+        let (conn, notifier_key) = match (path.as_ref(), &default_storage_dir) {
+          (Some(PathOrInMemory::InMemory), _) | (None, None) => (
             Arc::new(rusqlite::Connection::open_in_memory) as ConnGen,
             None,
           ),
-          (Some(path), _) => {
-            let flags =
-              OpenFlags::default().difference(OpenFlags::SQLITE_OPEN_URI);
-            let resolved_path = canonicalize_path(&PathBuf::from(path))
+          (Some(PathOrInMemory::Path(path)), _) => {
+            let flags = OpenFlags::default()
+              .difference(OpenFlags::SQLITE_OPEN_URI)
+              | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+            #[cfg(windows)]
+            refuse_reparse_point_components(path)
               .map_err(JsErrorBox::from_err)?;
-            let path = path.to_string();
+            // Open with the unresolved path so SQLITE_OPEN_NOFOLLOW keeps
+            // rejecting symlinks, but key the notifier on the normalized
+            // absolute path so lexical aliases of the same database (e.g.
+            // `db.sqlite` and `./db.sqlite`) share one notifier. Resolving
+            // symlinks here cannot redirect the open: paths containing
+            // symlinks are refused above.
+            let notifier_key =
+              deno_path_util::fs::canonicalize_path_maybe_not_exists(
+                &sys_traits::impls::RealSys,
+                path,
+              )
+              .map_err(JsErrorBox::from_err)?;
+            let path = path.clone();
             (
               Arc::new(move || {
                 rusqlite::Connection::open_with_flags(&path, flags)
               }) as ConnGen,
-              Some(resolved_path),
+              Some(notifier_key),
             )
           }
           (None, Some(path)) => {
+            #[allow(
+              clippy::disallowed_methods,
+              reason = "the storage directory is always on the real fs"
+            )]
             std::fs::create_dir_all(path).map_err(JsErrorBox::from_err)?;
             let path = path.join("kv.sqlite3");
             let path2 = path.clone();
@@ -212,34 +271,5 @@ impl<P: SqliteDbHandlerPermissions> DatabaseHandler for SqliteDbHandler<P> {
       config,
     )
     .map_err(|e| JsErrorBox::generic(e.to_string()))
-  }
-}
-
-/// Same as Path::canonicalize, but also handles non-existing paths.
-fn canonicalize_path(path: &Path) -> Result<PathBuf, std::io::Error> {
-  let path = normalize_path(path);
-  let mut path = path;
-  let mut names_stack = Vec::new();
-  loop {
-    match path.canonicalize() {
-      Ok(mut canonicalized_path) => {
-        for name in names_stack.into_iter().rev() {
-          canonicalized_path = canonicalized_path.join(name);
-        }
-        return Ok(canonicalized_path);
-      }
-      Err(err) if err.kind() == ErrorKind::NotFound => {
-        let file_name = path.file_name().map(|os_str| os_str.to_os_string());
-        if let Some(file_name) = file_name {
-          names_stack.push(file_name.to_str().unwrap().to_string());
-          path = path.parent().unwrap().to_path_buf();
-        } else {
-          names_stack.push(path.to_str().unwrap().to_string());
-          let current_dir = current_dir()?;
-          path.clone_from(&current_dir);
-        }
-      }
-      Err(err) => return Err(err),
-    }
   }
 }

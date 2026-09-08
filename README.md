@@ -40,7 +40,7 @@ irm https://deno.land/install.ps1 | iex
 brew install deno
 ```
 
-[Chocolatey](https://chocolatey.org/packages/deno) (Windows):
+[Chocolatey](https://community.chocolatey.org/packages/deno) (Windows):
 
 ```powershell
 choco install deno
@@ -52,10 +52,17 @@ choco install deno
 winget install --id=DenoLand.Deno
 ```
 
+[Scoop](https://scoop.sh/#/apps?q=deno&id=678d8fb557b611df996989c675b1099630a5bbee)
+(Windows):
+
+```powershell
+scoop install main/deno
+```
+
 ### Build and install from source
 
-Complete instructions for building Deno from source can be found in the manual
-[here](https://docs.deno.com/runtime/manual/references/contributing/building_from_source).
+Complete instructions for building Deno from source can be found
+[here](https://github.com/denoland/deno/blob/main/.github/CONTRIBUTING.md#building-from-source).
 
 ## Your first Deno program
 
@@ -95,7 +102,7 @@ Learn more about writing and running Deno programs
 ## Contributing
 
 We appreciate your help! To contribute, please read our
-[contributing instructions](https://docs.deno.com/runtime/manual/references/contributing/).
+[contributing instructions](.github/CONTRIBUTING.md).
 
 [Build status - Cirrus]: https://github.com/denoland/deno/workflows/ci/badge.svg?branch=main&event=push
 [Build status]: https://github.com/denoland/deno/actions

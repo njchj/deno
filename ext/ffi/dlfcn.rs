@@ -1,28 +1,29 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::path::Path;
 use std::rc::Rc;
 
-use deno_core::op2;
-use deno_core::v8;
 use deno_core::GarbageCollected;
 use deno_core::OpState;
 use deno_core::Resource;
+use deno_core::op2;
+use deno_core::v8;
 use deno_error::JsErrorBox;
 use deno_error::JsErrorClass;
+use deno_permissions::PermissionsContainer;
+use denort_helper::DenoRtNativeAddonLoaderRc;
 use dlopen2::raw::Library;
 use serde::Deserialize;
-use serde_value::ValueDeserializer;
 
 use crate::ir::out_buffer_as_ptr;
 use crate::symbol::NativeType;
 use crate::symbol::Symbol;
 use crate::turbocall;
 use crate::turbocall::Turbocall;
-use crate::FfiPermissions;
 
 deno_error::js_error_wrapper!(dlopen2::Error, JsDlopen2Error, |err| {
   match err {
@@ -51,6 +52,9 @@ pub enum DlfcnError {
   Permission(#[from] deno_permissions::PermissionCheckError),
   #[class(inherit)]
   #[error(transparent)]
+  DenoRtLoad(#[from] denort_helper::LoadError),
+  #[class(inherit)]
+  #[error(transparent)]
   Other(#[from] JsErrorBox),
 }
 
@@ -60,7 +64,7 @@ pub struct DynamicLibraryResource {
 }
 
 impl Resource for DynamicLibraryResource {
-  fn name(&self) -> Cow<str> {
+  fn name(&self) -> Cow<'_, str> {
     "dynamicLibrary".into()
   }
 
@@ -114,7 +118,10 @@ struct ForeignStatic {
 #[derive(Debug)]
 enum ForeignSymbol {
   ForeignFunction(ForeignFunction),
-  ForeignStatic(#[allow(dead_code)] ForeignStatic),
+  ForeignStatic(
+    #[allow(dead_code, reason = "variant data used by serde deserialization")]
+    ForeignStatic,
+  ),
 }
 
 impl<'de> Deserialize<'de> for ForeignSymbol {
@@ -122,46 +129,43 @@ impl<'de> Deserialize<'de> for ForeignSymbol {
   where
     D: serde::Deserializer<'de>,
   {
-    let value = serde_value::Value::deserialize(deserializer)?;
+    let value = serde_json::Value::deserialize(deserializer)?;
 
     // Probe a ForeignStatic and if that doesn't match, assume ForeignFunction to improve error messages
-    if let Ok(res) = ForeignStatic::deserialize(
-      ValueDeserializer::<D::Error>::new(value.clone()),
-    ) {
-      Ok(ForeignSymbol::ForeignStatic(res))
-    } else {
-      ForeignFunction::deserialize(ValueDeserializer::<D::Error>::new(value))
+    match ForeignStatic::deserialize(value.clone()) {
+      Ok(res) => Ok(ForeignSymbol::ForeignStatic(res)),
+      _ => ForeignFunction::deserialize(value)
         .map(ForeignSymbol::ForeignFunction)
+        .map_err(serde::de::Error::custom),
     }
   }
 }
 
-#[derive(Deserialize, Debug)]
-pub struct FfiLoadArgs {
-  path: String,
-  symbols: HashMap<String, ForeignSymbol>,
-}
-
 #[op2(stack_trace)]
-pub fn op_ffi_load<'scope, FP>(
-  scope: &mut v8::HandleScope<'scope>,
+pub fn op_ffi_load<'scope>(
+  scope: &mut v8::PinScope<'scope, '_>,
   state: Rc<RefCell<OpState>>,
-  #[serde] args: FfiLoadArgs,
-) -> Result<v8::Local<'scope, v8::Value>, DlfcnError>
-where
-  FP: FfiPermissions + 'static,
-{
-  let path = {
+  #[string] path: &str,
+  #[serde] symbols: HashMap<String, ForeignSymbol>,
+) -> Result<v8::Local<'scope, v8::Value>, DlfcnError> {
+  let (path, denort_helper) = {
     let mut state = state.borrow_mut();
-    let permissions = state.borrow_mut::<FP>();
-    permissions.check_partial_with_path(&args.path)?
+    let permissions = state.borrow_mut::<PermissionsContainer>();
+    (
+      permissions
+        .check_ffi_partial_with_path(Cow::Borrowed(Path::new(path)))?,
+      state.try_borrow::<DenoRtNativeAddonLoaderRc>().cloned(),
+    )
   };
 
-  let lib = Library::open(&path).map_err(|e| {
-    dlopen2::Error::OpeningLibraryError(std::io::Error::new(
-      std::io::ErrorKind::Other,
-      format_error(e, &path),
-    ))
+  let real_path = match denort_helper {
+    Some(loader) => loader.load_and_resolve_path(&path)?,
+    None => Cow::Borrowed(path.as_ref()),
+  };
+  let lib = Library::open(real_path.as_ref()).map_err(|e| {
+    dlopen2::Error::OpeningLibraryError(std::io::Error::other(format_error(
+      e, &real_path,
+    )))
   })?;
   let mut resource = DynamicLibraryResource {
     lib,
@@ -169,7 +173,7 @@ where
   };
   let obj = v8::Object::new(scope);
 
-  for (symbol_key, foreign_symbol) in args.symbols {
+  for (symbol_key, foreign_symbol) in symbols {
     match foreign_symbol {
       ForeignSymbol::ForeignStatic(_) => {
         // No-op: Statics will be handled separately and are not part of the Rust-side resource.
@@ -242,21 +246,28 @@ where
   Ok(out.into())
 }
 
-struct FunctionData {
+pub struct FunctionData {
   // Held in a box to keep memory while function is alive.
-  #[allow(unused)]
-  symbol: Box<Symbol>,
+  #[allow(unused, reason = "kept alive for the duration of the function")]
+  pub symbol: Box<Symbol>,
   // Held in a box to keep inner data alive while function is alive.
-  #[allow(unused)]
+  #[allow(unused, reason = "kept alive for the duration of the function")]
   turbocall: Option<Turbocall>,
 }
 
-impl GarbageCollected for FunctionData {}
+// SAFETY: we're sure `FunctionData` can be GCed
+unsafe impl GarbageCollected for FunctionData {
+  fn trace(&self, _visitor: &mut deno_core::v8::cppgc::Visitor) {}
+
+  fn get_name(&self) -> &'static std::ffi::CStr {
+    c"FunctionData"
+  }
+}
 
 // Create a JavaScript function for synchronous FFI call to
 // the given symbol.
 fn make_sync_fn<'s>(
-  scope: &mut v8::HandleScope<'s>,
+  scope: &mut v8::PinScope<'s, '_>,
   symbol: Box<Symbol>,
 ) -> v8::Local<'s, v8::Function> {
   let turbocall = if turbocall::is_compatible(&symbol) {
@@ -274,20 +285,21 @@ fn make_sync_fn<'s>(
     None
   };
 
-  let c_function = turbocall.as_ref().map(|turbocall| {
-    v8::fast_api::CFunction::new(
-      turbocall.trampoline.ptr(),
-      &turbocall.c_function_info,
-    )
-  });
+  // SAFETY: the overload slice is backed by boxes owned by `turbocall`, which
+  // is moved into the cppgc `FunctionData` set as this function's data below and
+  // therefore outlives the function. V8 150.x retains the raw pointer, so the
+  // slice must be `'static`.
+  let overloads = turbocall
+    .as_ref()
+    .map(|turbocall| unsafe { turbocall.overloads() });
 
   let data = FunctionData { symbol, turbocall };
   let data = deno_core::cppgc::make_cppgc_object(scope, data);
 
   let builder = v8::FunctionTemplate::builder(sync_fn_impl).data(data.into());
 
-  let func = if let Some(c_function) = c_function {
-    builder.build_fast(scope, &[c_function])
+  let func = if let Some(overloads) = overloads {
+    builder.build_fast(scope, overloads)
   } else {
     builder.build(scope)
   };
@@ -295,7 +307,7 @@ fn make_sync_fn<'s>(
 }
 
 fn sync_fn_impl<'s>(
-  scope: &mut v8::HandleScope<'s>,
+  scope: &mut v8::PinScope<'s, '_>,
   args: v8::FunctionCallbackArguments<'s>,
   mut rv: v8::ReturnValue,
 ) {
@@ -307,12 +319,9 @@ fn sync_fn_impl<'s>(
   let out_buffer = match data.symbol.result_type {
     NativeType::Struct(_) => {
       let argc = args.length();
-      out_buffer_as_ptr(
-        scope,
-        Some(
-          v8::Local::<v8::TypedArray>::try_from(args.get(argc - 1)).unwrap(),
-        ),
-      )
+      out_buffer_as_ptr(Some(
+        v8::Local::<v8::TypedArray>::try_from(args.get(argc - 1)).unwrap(),
+      ))
     }
     _ => None,
   };
@@ -328,7 +337,7 @@ fn sync_fn_impl<'s>(
 }
 
 // `path` is only used on Windows.
-#[allow(unused_variables)]
+#[allow(unused_variables, reason = "path is only used on Windows")]
 pub(crate) fn format_error(
   e: dlopen2::Error,
   path: &std::path::Path,
@@ -344,15 +353,12 @@ pub(crate) fn format_error(
     dlopen2::Error::OpeningLibraryError(e) => {
       use std::os::windows::ffi::OsStrExt;
 
-      use winapi::shared::minwindef::DWORD;
-      use winapi::shared::winerror::ERROR_INSUFFICIENT_BUFFER;
-      use winapi::um::errhandlingapi::GetLastError;
-      use winapi::um::winbase::FormatMessageW;
-      use winapi::um::winbase::FORMAT_MESSAGE_ARGUMENT_ARRAY;
-      use winapi::um::winbase::FORMAT_MESSAGE_FROM_SYSTEM;
-      use winapi::um::winnt::LANG_SYSTEM_DEFAULT;
-      use winapi::um::winnt::MAKELANGID;
-      use winapi::um::winnt::SUBLANG_SYS_DEFAULT;
+      use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+      use windows_sys::Win32::Foundation::GetLastError;
+      use windows_sys::Win32::Globalization::LANG_SYSTEM_DEFAULT;
+      use windows_sys::Win32::System::Diagnostics::Debug::FORMAT_MESSAGE_ARGUMENT_ARRAY;
+      use windows_sys::Win32::System::Diagnostics::Debug::FORMAT_MESSAGE_FROM_SYSTEM;
+      use windows_sys::Win32::System::Diagnostics::Debug::FormatMessageW;
 
       let err_num = match e.raw_os_error() {
         Some(err_num) => err_num,
@@ -360,9 +366,8 @@ pub(crate) fn format_error(
         None => return e.to_string(),
       };
 
-      // Language ID (0x0800)
-      let lang_id =
-        MAKELANGID(LANG_SYSTEM_DEFAULT, SUBLANG_SYS_DEFAULT) as DWORD;
+      // Language ID (0x0800), i.e. MAKELANGID(LANG_NEUTRAL, SUBLANG_SYS_DEFAULT)
+      let lang_id = LANG_SYSTEM_DEFAULT as u32;
 
       let mut buf = vec![0; 500];
 
@@ -376,22 +381,22 @@ pub(crate) fn format_error(
 
       loop {
         // SAFETY:
-        // winapi call to format the error message
+        // Win32 call to format the error message
         let length = unsafe {
           FormatMessageW(
             FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_ARGUMENT_ARRAY,
-            std::ptr::null_mut(),
-            err_num as DWORD,
-            lang_id as DWORD,
+            std::ptr::null(),
+            err_num as u32,
+            lang_id,
             buf.as_mut_ptr(),
-            buf.len() as DWORD,
+            buf.len() as u32,
             arguments.as_ptr() as _,
           )
         };
 
         if length == 0 {
           // SAFETY:
-          // winapi call to get the last error message
+          // Win32 call to get the last error message
           let err_num = unsafe { GetLastError() };
           if err_num == ERROR_INSUFFICIENT_BUFFER {
             buf.resize(buf.len() * 2, 0);
@@ -412,11 +417,110 @@ pub(crate) fn format_error(
 
 #[cfg(test)]
 mod tests {
+  use std::ffi::c_void;
+  use std::sync::atomic::AtomicUsize;
+  use std::sync::atomic::Ordering;
+
+  use deno_core::JsRuntime;
+  use deno_core::RuntimeOptions;
+  use deno_core::v8;
   use serde_json::json;
 
   use super::ForeignFunction;
   use super::ForeignSymbol;
+  use super::make_sync_fn;
   use crate::symbol::NativeType;
+  use crate::symbol::Symbol;
+  use crate::turbocall;
+
+  #[derive(Clone, Copy)]
+  #[repr(C)]
+  struct Rect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+  }
+
+  static MAKE_RECT_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+  extern "C" fn make_rect(x: f64, y: f64, width: f64, height: f64) -> Rect {
+    MAKE_RECT_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+    Rect {
+      x,
+      y,
+      width,
+      height,
+    }
+  }
+
+  #[test]
+  fn sync_struct_return_views() {
+    MAKE_RECT_CALL_COUNT.store(0, Ordering::Relaxed);
+
+    let parameter_types = vec![NativeType::F64; 4];
+    let result_type =
+      NativeType::Struct(vec![NativeType::F64; 4].into_boxed_slice());
+    let symbol = Symbol {
+      name: "make_rect".to_string(),
+      cif: libffi::middle::Cif::new(
+        parameter_types
+          .clone()
+          .into_iter()
+          .map(libffi::middle::Type::try_from)
+          .collect::<Result<Vec<_>, _>>()
+          .unwrap(),
+        result_type.clone().try_into().unwrap(),
+      ),
+      ptr: libffi::middle::CodePtr::from_ptr(
+        make_rect as *const () as *const c_void,
+      ),
+      parameter_types,
+      result_type,
+    };
+    assert!(!turbocall::is_compatible(&symbol));
+
+    let mut runtime = JsRuntime::new(RuntimeOptions::default());
+    {
+      deno_core::scope!(scope, runtime);
+      let function = make_sync_fn(scope, Box::new(symbol));
+      let key = v8::String::new(scope, "makeRect").unwrap();
+      let global = scope.get_current_context().global(scope);
+      assert_eq!(global.set(scope, key.into(), function.into()), Some(true));
+    }
+
+    runtime
+      .execute_script(
+        "ffi_sync_call_test.js",
+        r#"
+          const backing = new Uint8Array(64);
+          backing.fill(0xee);
+          const out = new Uint8Array(backing.buffer, 16, 32);
+          makeRect(1, 2, 3, 4, out);
+          const values = new Float64Array(backing.buffer, 16, 4);
+          if (values[0] !== 1 || values[1] !== 2 ||
+              values[2] !== 3 || values[3] !== 4) {
+            throw new Error("unexpected struct result");
+          }
+          if (backing[0] !== 0xee || backing[63] !== 0xee) {
+            throw new Error("write escaped the return view");
+          }
+          try {
+            makeRect(1, 2, 3, 4, new Uint8Array(31));
+            throw new Error("synchronous call accepted an undersized buffer");
+          } catch (error) {
+            const expected =
+              "Invalid FFI struct return buffer: expected at least 32 bytes, got 31";
+            if (!(error instanceof TypeError) || error.message !== expected) {
+              throw error;
+            }
+          }
+        "#,
+      )
+      .unwrap();
+
+    assert_eq!(MAKE_RECT_CALL_COUNT.load(Ordering::Relaxed), 1);
+  }
 
   #[cfg(target_os = "windows")]
   #[test]

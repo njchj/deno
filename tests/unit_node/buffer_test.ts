@@ -1,6 +1,15 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
-import { Buffer } from "node:buffer";
+// Copyright 2018-2026 the Deno authors. MIT license.
+import {
+  Buffer,
+  constants,
+  File as BufferFile,
+  resolveObjectURL,
+  transcode,
+} from "node:buffer";
 import { assertEquals, assertThrows } from "@std/assert";
+import { strictEqual } from "node:assert";
+
+const { MAX_STRING_LENGTH } = constants;
 
 Deno.test({
   name: "[node/buffer] alloc fails if size is not a number",
@@ -271,6 +280,29 @@ Deno.test({
 });
 
 Deno.test({
+  name: "[node/buffer] Buffer.allocUnsafe does not truncate lengths > 2^32",
+  ignore: true, // requires >4GB of memory
+  fn() {
+    const size = 2 ** 32 + 5;
+    const buf = Buffer.allocUnsafe(size);
+    assertEquals(buf.length, size);
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] Buffer concat does not truncate buffers larger than 4GB",
+  ignore: true, // requires >4GB of memory
+  fn() {
+    const size = 2 ** 32 + 5;
+    const largeBuffer = Buffer.alloc(size);
+    largeBuffer.fill(111);
+    const result = Buffer.concat([largeBuffer]);
+    assertEquals(result.length, size);
+    assertEquals(Array.from(result.subarray(0, 5)), [111, 111, 111, 111, 111]);
+  },
+});
+
+Deno.test({
   name: "[node/buffer] Buffer 8 bit unsigned integers",
   fn() {
     const buffer = Buffer.from([0xff, 0x2a, 0x2a, 0x2a]);
@@ -475,6 +507,70 @@ Deno.test({
   },
 });
 
+// https://github.com/denoland/deno/issues/24908
+Deno.test({
+  name: "[node/buffer] Buffer from base64 with non-base64 characters",
+  fn() {
+    // Strings with hyphens should not throw
+    const buf1 = Buffer.from("base64-encoded-bytes-from-browser", "base64");
+    assertEquals(buf1.length, 24);
+    assertEquals(
+      buf1.toString("hex"),
+      "6dab1eeb8f9e9dca1d79df9bcad7acf9fae89be6eba30b1e",
+    );
+
+    const buf2 = Buffer.from("not-valid-base64!!!", "base64");
+    assertEquals(buf2.length, 12);
+
+    // Single character (too short for base64)
+    assertEquals(Buffer.from("A", "base64").length, 0);
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] Buffer.from base64 accepts dirty input",
+  fn() {
+    const expected = Buffer.from("hello world");
+    // Unpadded, padded, and whitespace-laced input decodes without cleaning.
+    assertEquals(Buffer.from("aGVsbG8gd29ybGQ", "base64"), expected);
+    assertEquals(Buffer.from("aGVsbG8gd29ybGQ=", "base64"), expected);
+    assertEquals(Buffer.from("aGVs bG8g\nd29y\tbGQ", "base64"), expected);
+    // base64url alphabet maps onto the standard one (Node cleaning
+    // semantics).
+    assertEquals(
+      Buffer.from("-_-_", "base64"),
+      Buffer.from([0xfb, 0xff, 0xbf]),
+    );
+    // Junk characters are stripped; everything after '=' is dropped.
+    assertEquals(Buffer.from("aGVsbG8!gd29ybGQ", "base64"), expected);
+    assertEquals(
+      Buffer.from("aGVsbG8=gd29ybGQ", "base64").toString(),
+      "hello",
+    );
+    // Characters above U+00FF take the cleaning path via the catch.
+    assertEquals(Buffer.from("aGVsbG8\u{1F600}gd29ybGQ", "base64"), expected);
+    assertEquals(Buffer.from("!!!", "base64").length, 0);
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] base64 write truncates into small targets",
+  fn() {
+    const small = Buffer.alloc(2);
+    assertEquals(small.write("aGVsbG8gd29ybGQ=", "base64"), 2);
+    assertEquals(small.toString(), "he");
+
+    const buf = Buffer.alloc(16, 0x2e);
+    assertEquals(buf.write("aGVsbG8=", 3, "base64"), 5);
+    assertEquals(buf.toString("latin1"), "...hello........");
+
+    // Dirty input truncates through the cleaning fallback too.
+    const dirty = Buffer.alloc(2);
+    assertEquals(dirty.write("aGVs bG8!gd29ybGQ", "base64"), 2);
+    assertEquals(dirty.toString(), "he");
+  },
+});
+
 Deno.test({
   name: "[node/buffer] Buffer to string base64",
   fn() {
@@ -593,6 +689,240 @@ Deno.test({
   },
 });
 
+// https://github.com/denoland/deno/issues/34286
+Deno.test({
+  name: "[node/buffer] base64Slice allows omitting arguments",
+  fn() {
+    const buf = Buffer.of(1, 2, 3);
+    // @ts-expect-error Buffer.prototype.base64Slice is an undocumented API
+    assertEquals(buf.base64Slice(), "AQID");
+    // @ts-expect-error Buffer.prototype.base64Slice is an undocumented API
+    assertEquals(buf.base64Slice(0, 3), "AQID");
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] base64Slice validates its range",
+  fn() {
+    const buf = Buffer.alloc(10);
+    assertThrows(
+      () => {
+        // @ts-expect-error Buffer.prototype.base64Slice is undocumented
+        buf.base64Slice(20, 25);
+      },
+      RangeError,
+    );
+    assertThrows(
+      () => {
+        // @ts-expect-error Buffer.prototype.base64Slice is undocumented
+        buf.base64Slice(0, 20);
+      },
+      RangeError,
+    );
+    // @ts-expect-error Buffer.prototype.base64Slice is undocumented
+    assertEquals(buf.base64Slice(5, 4), "");
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] base64Write validates its offset",
+  fn() {
+    const buf = Buffer.alloc(10);
+    assertThrows(
+      () => {
+        Buffer.prototype.base64Write.call(buf, "YmFzZTY0", 100);
+      },
+      RangeError,
+    );
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] base64 write respects the length limit",
+  fn() {
+    const buf = Buffer.alloc(64);
+    buf.fill(0x61, 32);
+    const input = Buffer.from("B".repeat(48)).toString("base64");
+
+    assertEquals(buf.write(input, 0, 32, "base64"), 32);
+    assertEquals(buf.subarray(0, 32), Buffer.alloc(32, 0x42));
+    assertEquals(buf.subarray(32), Buffer.alloc(32, 0x61));
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] base64 operations use the actual buffer length",
+  fn() {
+    const buf = Buffer.from("abcdef");
+    Object.defineProperty(buf, "byteLength", { value: 0 });
+
+    assertEquals(buf.toString("base64", 1, 4), "YmNk");
+    assertEquals(buf.write("WFla", 1, 2, "base64"), 2);
+    assertEquals(buf.toString(), "aXYdef");
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] base64urlSlice allows omitting arguments",
+  fn() {
+    const buf = Buffer.of(1, 2, 3);
+    // @ts-expect-error Buffer.prototype.base64urlSlice is an undocumented API
+    assertEquals(buf.base64urlSlice(), "AQID");
+    // @ts-expect-error Buffer.prototype.base64urlSlice is an undocumented API
+    assertEquals(buf.base64urlSlice(0, 3), "AQID");
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] base64url round-trips",
+  fn() {
+    for (
+      const bytes of [
+        [],
+        [0],
+        [0xfb],
+        [0xfb, 0xff],
+        [0xfb, 0xff, 0x7e],
+        [0xfb, 0xff, 0x7e, 0x00],
+      ]
+    ) {
+      const buf = Buffer.from(bytes);
+      const encoded = buf.toString("base64url");
+      // URL-safe alphabet, no padding.
+      assertEquals(/^[-_A-Za-z0-9]*$/.test(encoded), true);
+      assertEquals(Buffer.from(encoded, "base64url"), buf);
+    }
+    // Larger than the op's 8 KiB stack buffer.
+    const bytes = new Uint8Array(65536);
+    for (let i = 0; i < bytes.length; i++) bytes[i] = (i * 31) & 0xff;
+    const big = Buffer.from(bytes);
+    assertEquals(Buffer.from(big.toString("base64url"), "base64url"), big);
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] base64url sub-range toString",
+  fn() {
+    const buf = Buffer.from("hello world");
+    assertEquals(buf.toString("base64url", 1, 5), "ZWxsbw");
+    assertEquals(buf.toString("base64url", 0, buf.length), "aGVsbG8gd29ybGQ");
+    assertEquals(buf.toString("base64url", 4, 4), "");
+    // Out-of-range bounds are clamped by toString.
+    assertEquals(buf.toString("base64url", -5, 100), "aGVsbG8gd29ybGQ");
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] Buffer.from base64url accepts dirty input",
+  fn() {
+    const expected = Buffer.from("hello world");
+    // Padded and unpadded.
+    assertEquals(Buffer.from("aGVsbG8gd29ybGQ", "base64url"), expected);
+    assertEquals(Buffer.from("aGVsbG8gd29ybGQ=", "base64url"), expected);
+    // Whitespace-laced.
+    assertEquals(Buffer.from("aGVs bG8g\nd29y\tbGQ", "base64url"), expected);
+    // Mixed/standard alphabet (Node cleaning semantics).
+    assertEquals(
+      Buffer.from("+/+/", "base64url"),
+      Buffer.from([0xfb, 0xff, 0xbf]),
+    );
+    // Junk characters are stripped; everything after '=' is dropped.
+    assertEquals(Buffer.from("aGVsbG8!gd29ybGQ", "base64url"), expected);
+    assertEquals(
+      Buffer.from("aGVsbG8=gd29ybGQ", "base64url").toString(),
+      "hello",
+    );
+    assertEquals(Buffer.from("!!!", "base64url").length, 0);
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] base64url write truncates into small targets",
+  fn() {
+    const small = Buffer.alloc(2);
+    assertEquals(small.write("aGVsbG8gd29ybGQ", "base64url"), 2);
+    assertEquals(small.toString(), "he");
+
+    const buf = Buffer.alloc(16, 0x2e);
+    assertEquals(buf.write("aGVsbG8", 3, "base64url"), 5);
+    assertEquals(buf.toString("latin1"), "...hello........");
+
+    const limited = Buffer.alloc(64);
+    limited.fill(0x61, 32);
+    const input = Buffer.from("B".repeat(48)).toString("base64url");
+    assertEquals(limited.write(input, 0, 32, "base64url"), 32);
+    assertEquals(limited.subarray(0, 32), Buffer.alloc(32, 0x42));
+    assertEquals(limited.subarray(32), Buffer.alloc(32, 0x61));
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] base64urlWrite validates its offset",
+  fn() {
+    const buf = Buffer.alloc(10);
+    assertThrows(
+      () => {
+        Buffer.prototype.base64urlWrite.call(buf, "YmFzZTY0", 100);
+      },
+      RangeError,
+    );
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] base64url on views with non-zero byteOffset",
+  fn() {
+    const ab = new ArrayBuffer(32);
+    const raw = new Uint8Array(ab);
+    for (let i = 0; i < raw.length; i++) raw[i] = i;
+
+    // The ops receive the view, not the whole ArrayBuffer.
+    const view = Buffer.from(ab, 8, 16);
+    const copy = Buffer.from(raw.slice(8, 24));
+    assertEquals(view.toString("base64url"), copy.toString("base64url"));
+    assertEquals(
+      view.toString("base64url", 1, 5),
+      copy.toString("base64url", 1, 5),
+    );
+
+    // Writes land inside the view and leave the rest of the buffer alone.
+    assertEquals(view.write("_____w", 2, "base64url"), 4);
+    assertEquals(Array.from(raw.subarray(10, 14)), [0xff, 0xff, 0xff, 0xff]);
+    assertEquals(raw[9], 9);
+    assertEquals(raw[14], 14);
+    assertEquals(raw[24], 24);
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] base64 on views with non-zero byteOffset",
+  fn() {
+    const ab = new ArrayBuffer(32);
+    const raw = new Uint8Array(ab);
+    for (let i = 0; i < raw.length; i++) raw[i] = i;
+
+    // The ops receive the view, not the whole ArrayBuffer.
+    const view = Buffer.from(ab, 8, 16);
+    const copy = Buffer.from(raw.slice(8, 24));
+    assertEquals(view.toString("base64"), copy.toString("base64"));
+    assertEquals(
+      view.toString("base64", 1, 5),
+      copy.toString("base64", 1, 5),
+    );
+
+    // Unpadded input takes the loose path; padded input the strict path.
+    // Both land inside the view and leave the rest of the buffer alone.
+    assertEquals(view.write("//////", 2, "base64"), 4);
+    assertEquals(Array.from(raw.subarray(10, 14)), [0xff, 0xff, 0xff, 0xff]);
+    assertEquals(view.write("AQIDBA==", 10, "base64"), 4);
+    assertEquals(Array.from(raw.subarray(18, 22)), [1, 2, 3, 4]);
+    assertEquals(raw[9], 9);
+    assertEquals(raw[14], 14);
+    assertEquals(raw[17], 17);
+    assertEquals(raw[24], 24);
+  },
+});
+
 Deno.test({
   name: "[node/buffer] isEncoding returns true for valid encodings",
   fn() {
@@ -649,5 +979,515 @@ Deno.test({
     // @ts-expect-error Buffer.prototype.utf8Write is an undocumented API
     assertEquals(buf.utf8Write("abc", 0), 3);
     assertEquals([...buf], [0x61, 0x62, 0x63, 0, 0, 0, 0, 0]);
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] Buffer.from pool",
+  fn() {
+    const a = Buffer.from("hello world");
+    const b = Buffer.from("hello world");
+    strictEqual(a.buffer, b.buffer);
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] toString('utf8') keeps BOM",
+  fn() {
+    assertEquals(
+      Buffer.from([239, 187, 191, 97, 98]).toString("utf8"),
+      "\uFEFFab",
+    );
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] throws ERR_STRING_TOO_LONG with the correct message",
+  fn() {
+    assertThrows(
+      () => {
+        Buffer.allocUnsafe(2 ** 31).toString();
+      },
+      Error,
+      `Cannot create a string longer than 0x${
+        MAX_STRING_LENGTH.toString(16)
+      } characters`,
+    );
+  },
+});
+
+Deno.test({
+  name:
+    "[node/buffer] Buffer.from with hex encoding should truncate first non-hex character",
+  fn() {
+    const buf = Buffer.from("00aafffz", "hex");
+    assertEquals(buf, Buffer.from([0x00, 0xaa, 0xff]));
+
+    const buf2 = Buffer.from("zz34", "hex");
+    assertEquals(buf2, Buffer.from([]));
+
+    const buf3 = Buffer.from("123😁aa", "hex");
+    assertEquals(buf3, Buffer.from([0x12]));
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] hexWrite validates its offset and length",
+  fn() {
+    const buf = Buffer.alloc(10);
+    // Same validation block as base64Write: out-of-bounds and negative
+    // offsets and negative lengths throw coded RangeErrors (negative length
+    // previously returned its own value without writing).
+    for (
+      const call of [
+        () => Buffer.prototype.hexWrite.call(buf, "aabb", 20),
+        () => Buffer.prototype.hexWrite.call(buf, "aabb", -1),
+        () => Buffer.prototype.hexWrite.call(buf, "aabb", 0, -5),
+      ]
+    ) {
+      const err = assertThrows(call, RangeError);
+      assertEquals(
+        (err as { code?: string }).code,
+        "ERR_BUFFER_OUT_OF_BOUNDS",
+      );
+    }
+    // offset == length writes nothing; oversized length clamps (Node
+    // parity).
+    assertEquals(Buffer.prototype.hexWrite.call(buf, "aabb", 10), 0);
+    assertEquals(
+      Buffer.prototype.hexWrite.call(buf, "aabbccddee", 8, 100),
+      2,
+    );
+    assertEquals(buf.toString("hex"), "0000000000000000aabb");
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] hexSlice direct-call index semantics match Node",
+  fn() {
+    const buf = Buffer.from([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    const hexSlice = Buffer.prototype.hexSlice;
+    // A forward range reaching past the end throws Node's coded RangeError,
+    // as do negative indexes.
+    for (
+      const call of [
+        () => hexSlice.call(buf, 0, 999),
+        () => hexSlice.call(buf, -1, 5),
+        () => hexSlice.call(buf, 0, -1),
+      ]
+    ) {
+      const err = assertThrows(call, RangeError, "Index out of range");
+      assertEquals((err as { code?: string }).code, "ERR_OUT_OF_RANGE");
+    }
+    // Reversed, empty, and Infinity-start ranges return "" (Node's
+    // StringSlice checks end <= start before bounds).
+    assertEquals(hexSlice.call(buf, 20, 5), "");
+    assertEquals(hexSlice.call(buf, 5, 2), "");
+    assertEquals(hexSlice.call(buf, 10, 10), "");
+    assertEquals(hexSlice.call(buf, Infinity), "");
+    // ToInteger coercion.
+    assertEquals(hexSlice.call(buf, "2", "5"), "030405");
+    assertEquals(hexSlice.call(buf, 1.9, 5.9), "02030405");
+    assertEquals(hexSlice.call(buf, NaN, 4), "01020304");
+    assertEquals(hexSlice.call(buf), "0102030405060708090a");
+    // Any ArrayBufferView receiver encodes its underlying bytes.
+    assertEquals(
+      hexSlice.call(new Uint8ClampedArray([1, 2, 3]), 0, 3),
+      "010203",
+    );
+    // Detached buffers report length 0: both the clamped toString path and
+    // explicit-arg direct calls return "".
+    const ab = new ArrayBuffer(8);
+    const view = Buffer.from(ab);
+    structuredClone(ab, { transfer: [ab] });
+    assertEquals(view.toString("hex"), "");
+    assertEquals(hexSlice.call(view, 0, 5), "");
+    // DataView receivers fail the TypedArray brand check. The old op accepted
+    // any ArrayBufferView here; Node rejects non-Uint8Array receivers, so
+    // throwing is the closer behavior.
+    assertThrows(
+      () => hexSlice.call(new DataView(new ArrayBuffer(4)), 0, 4),
+      TypeError,
+    );
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] hex on views with non-zero byteOffset",
+  fn() {
+    const ab = new ArrayBuffer(32);
+    const raw = new Uint8Array(ab);
+    for (let i = 0; i < raw.length; i++) raw[i] = i;
+    const view = Buffer.from(ab, 8, 16);
+    const copy = Buffer.from(raw.slice(8, 24));
+    assertEquals(view.toString("hex"), copy.toString("hex"));
+    assertEquals(view.toString("hex", 1, 5), copy.toString("hex", 1, 5));
+    // 64 KiB crosses the old external-string threshold.
+    const big = Buffer.alloc(65536, 0xab);
+    assertEquals(big.toString("hex").length, 131072);
+    assertEquals(big.toString("hex", 1, 257).length, 512);
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] hex decode dirty-input semantics",
+  fn() {
+    // Odd-length input drops the trailing char (pre-trimmed fast path).
+    assertEquals(Buffer.from("abc", "hex"), Buffer.from([0xab]));
+    assertEquals(Buffer.from("aabbc", "hex"), Buffer.from([0xaa, 0xbb]));
+    // Whitespace and chars above U+00FF truncate through the fallback.
+    assertEquals(Buffer.from("aa bb", "hex"), Buffer.from([0xaa]));
+    assertEquals(Buffer.from("aa\u{1F600}bb", "hex"), Buffer.from([0xaa]));
+    // The fallback masks charCodeAt with 0xff, so chars above U+00FF whose
+    // low byte is a hex digit decode: U+0141 -> 'A', U+0142 -> 'B'. The
+    // native path rejects them, so this pins the fallback's old semantics.
+    assertEquals(
+      Buffer.from("aa\u0141\u0142", "hex"),
+      Buffer.from([0xaa, 0xab]),
+    );
+    // Mixed case decodes on the fast path.
+    assertEquals(
+      Buffer.from("aAbBcC", "hex"),
+      Buffer.from([0xaa, 0xbb, 0xcc]),
+    );
+    // Target fills before trailing junk is reached: clean fast-path return
+    // (Node's target-capped write), no fallback involved.
+    const small = Buffer.alloc(2);
+    assertEquals(small.write("aabbzz", "hex"), 2);
+    assertEquals(small.toString("hex"), "aabb");
+    // Junk before the target fills goes through the truncating fallback.
+    const dirty = Buffer.alloc(2);
+    assertEquals(dirty.write("aazzbb", "hex"), 1);
+    assertEquals(dirty.toString("hex"), "aa00");
+    // A partial native write before the invalid pair must not leave stale
+    // bytes past the truncation point once the fallback rewrites the prefix.
+    const partial = Buffer.alloc(4);
+    assertEquals(partial.write("aabbzz11", "hex"), 2);
+    assertEquals(Array.from(partial), [0xaa, 0xbb, 0, 0]);
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] hex write into views with non-zero byteOffset",
+  fn() {
+    const ab = new ArrayBuffer(32);
+    const raw = new Uint8Array(ab);
+    for (let i = 0; i < raw.length; i++) raw[i] = i;
+    const view = Buffer.from(ab, 8, 16);
+    // Writes land inside the view and leave the rest of the buffer alone.
+    assertEquals(view.write("ffff", 2, "hex"), 2);
+    assertEquals(Array.from(raw.subarray(10, 12)), [0xff, 0xff]);
+    assertEquals(raw[9], 9);
+    assertEquals(raw[12], 12);
+    assertEquals(raw[24], 24);
+    // An explicit length caps the write window.
+    assertEquals(view.write("aabbccdd", 12, 2, "hex"), 2);
+    assertEquals(Array.from(raw.subarray(20, 23)), [0xaa, 0xbb, 22]);
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] File is exported from node:buffer",
+  fn() {
+    assertEquals(typeof BufferFile, "function");
+    const file = new BufferFile(["hello"], "hello.txt", {
+      type: "text/plain",
+    });
+    assertEquals(file.name, "hello.txt");
+    assertEquals(file.type, "text/plain");
+    assertEquals(file.size, 5);
+    assertEquals(file instanceof Blob, true);
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] latin1Slice returns correct string",
+  fn() {
+    // deno-lint-ignore no-explicit-any
+    const buf: any = Buffer.of(1, 2, 3, 0xff);
+    assertEquals(buf.latin1Slice().length, 4);
+    assertEquals(buf.latin1Slice(), "\x01\x02\x03\xff");
+    assertEquals(buf.latin1Slice(1, 3), "\x02\x03");
+    assertEquals(buf.latin1Slice(1, 0), "");
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] asciiSlice returns correct string",
+  fn() {
+    // deno-lint-ignore no-explicit-any
+    const buf: any = Buffer.of(1, 2, 3, 0x80, 0x81, 0x82, 0x83, 0xc0, 0xff);
+    assertEquals(buf.asciiSlice().length, 9);
+    assertEquals(buf.asciiSlice(), "\x01\x02\x03\x00\x01\x02\x03\x40\x7f");
+    assertEquals(buf.asciiSlice(1, 3), "\x02\x03");
+
+    // test `new_external_onebyte`
+    // ZERO_COPY_THRESHOLD 1024
+    //
+    // deno-lint-ignore no-explicit-any
+    const buf1111: any = Buffer.alloc(1111);
+    for (let i = 0, len = buf1111.length; i < len; i++) {
+      buf1111[i] = Math.random() * 128;
+    }
+    const target1111: string = buf1111.latin1Slice();
+    assertEquals(buf1111.asciiSlice(), target1111);
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] ucs2Slice returns correct string",
+  fn() {
+    // deno-lint-ignore no-explicit-any
+    const buf: any = Buffer.of(
+      0x60,
+      0x4f,
+      0x7d,
+      0x59,
+      0x44,
+      0x00,
+      0x65,
+      0x00,
+      0x6e,
+      0x00,
+      0x6f,
+      0x00,
+    );
+
+    assertEquals(buf.ucs2Slice().length, 6);
+    assertEquals(buf.ucs2Slice(), "你好Deno");
+    assertEquals(buf.ucs2Slice(0, 4), "你好");
+    assertEquals(buf.ucs2Slice(4, 12), "Deno");
+    assertEquals(buf.ucs2Slice(0, 3), "你");
+    assertEquals(buf.ucs2Slice(1, 4), "絏");
+    assertEquals(buf.ucs2Slice(1, 6), "絏䑙");
+
+    // deno-lint-ignore no-explicit-any
+    const oddBuf: any = Buffer.of(0x60, 0x4f, 0x7d, 0x59, 0x44);
+    assertEquals(oddBuf.ucs2Slice(), "你好");
+
+    // test `new_external_twobyte`
+    // ZERO_COPY_THRESHOLD 1024
+    //
+    // deno-lint-ignore no-explicit-any
+    const buf2001: any = Buffer.alloc(2001);
+    for (let i = 1, len = buf2001.length; i < len; i++) {
+      buf2001[i] = Math.random() * 128;
+    }
+    const target2000: string = buf2001.ucs2Slice(1, 1001) +
+      buf2001.ucs2Slice(1001);
+    assertEquals(buf2001.ucs2Slice(1), target2000);
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] utf8Slice handles buffer detach during index coercion",
+  fn() {
+    // deno-lint-ignore no-explicit-any
+    const buf: any = Buffer.alloc(1024);
+    const arrayBuffer = buf.buffer;
+    const start = {
+      valueOf() {
+        structuredClone(arrayBuffer, { transfer: [arrayBuffer] });
+        return 0;
+      },
+    };
+
+    assertThrows(
+      () => buf.utf8Slice(start, 10),
+      RangeError,
+      "Index out of range",
+    );
+    assertEquals(arrayBuffer.byteLength, 0);
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] hexSlice returns correct string",
+  fn() {
+    // deno-lint-ignore no-explicit-any
+    const buf: any = Buffer.of(1, 2, 3, 0xff);
+    assertEquals(buf.hexSlice(), "010203ff");
+    assertEquals(buf.hexSlice(1, 3), "0203");
+
+    // deno-lint-ignore no-explicit-any
+    const emptyBuf: any = Buffer.of();
+    assertEquals(emptyBuf.hexSlice(), "");
+
+    // test `new_external_onebyte`
+    // ZERO_COPY_THRESHOLD 1024
+    //
+    // deno-lint-ignore no-explicit-any
+    const buf1111: any = Buffer.alloc(1111);
+    for (let i = 0, len = buf1111.length; i < len; i++) {
+      buf1111[i] = Math.random() * 128;
+    }
+    const target1111: string = buf1111.toHex();
+    assertEquals(buf1111.hexSlice(), target1111);
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] resolveObjectURL resolves blob URL",
+  async fn() {
+    const blob = new Blob(["hello"]);
+    const url = URL.createObjectURL(blob);
+    try {
+      const resolved = resolveObjectURL(url);
+      assertEquals(resolved instanceof Blob, true);
+      assertEquals(resolved!.size, 5);
+      assertEquals(
+        Buffer.from(await resolved!.arrayBuffer()).toString(),
+        "hello",
+      );
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] resolveObjectURL returns undefined for revoked URL",
+  fn() {
+    const blob = new Blob(["hello"]);
+    const url = URL.createObjectURL(blob);
+    URL.revokeObjectURL(url);
+    assertEquals(resolveObjectURL(url), undefined);
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] indexOf and includes work correctly",
+  fn() {
+    const buf = Buffer.from("Hello World");
+    assertEquals(buf.indexOf("World"), 6);
+    assertEquals(buf.indexOf("World", 0, "utf8"), 6);
+    assertEquals(buf.includes("Hello"), true);
+    assertEquals(buf.indexOf(Buffer.from("World")), 6);
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] resolveObjectURL returns undefined for invalid inputs",
+  fn() {
+    assertEquals(resolveObjectURL("not a url"), undefined);
+    assertEquals(resolveObjectURL("blob:nodedata:1:wrong"), undefined);
+    // deno-lint-ignore no-explicit-any
+    assertEquals(resolveObjectURL(undefined as any), undefined);
+    // deno-lint-ignore no-explicit-any
+    assertEquals(resolveObjectURL(1 as any), undefined);
+    // deno-lint-ignore no-explicit-any
+    assertEquals(resolveObjectURL({} as any), undefined);
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] transcode UTF-16LE to UTF-8 with odd-length input",
+  fn() {
+    // Odd-length: trailing byte is dropped (matches Node.js)
+    const odd = Buffer.from([0x61, 0x00, 0x62]);
+    assertEquals(transcode(odd, "utf16le", "utf8").toString(), "a");
+
+    // Even-length: normal case
+    const even = Buffer.from([0x48, 0x00, 0x69, 0x00]);
+    assertEquals(transcode(even, "utf16le", "utf8").toString(), "Hi");
+
+    // Empty buffer
+    const empty = Buffer.alloc(0);
+    assertEquals(transcode(empty, "utf16le", "utf8").toString(), "");
+
+    // Single byte (all trailing, dropped)
+    const single = Buffer.from([0x41]);
+    assertEquals(transcode(single, "utf16le", "utf8").toString(), "");
+  },
+});
+
+// Node's real Buffer has no _isBuffer marker; the npm `buffer` polyfill
+// (feross/buffer) sets it to true and libraries like bson use that to detect
+// a non-Node runtime and fall back to a Uint8Array codepath that breaks
+// mongodb SCRAM auth (denoland/deno#34468).
+Deno.test({
+  name: "[node/buffer] Buffer.prototype does not expose _isBuffer marker",
+  fn() {
+    // deno-lint-ignore no-explicit-any
+    assertEquals((Buffer.prototype as any)._isBuffer, undefined);
+    // deno-lint-ignore no-explicit-any
+    assertEquals((Buffer.alloc(1) as any)._isBuffer, undefined);
+  },
+});
+
+// Empty needle + negative end must clamp to 0, matching Node's
+// search_end = min(max(end, 0), haystack_length). Not covered by
+// upstream test-buffer-indexof.js
+Deno.test({
+  name: "[node/buffer] indexOf clamps negative end to 0 for empty needle",
+  fn() {
+    const buf = Buffer.from("abcabc");
+    assertEquals(buf.indexOf("", 0, -1), 0);
+    assertEquals(buf.indexOf("", 0, -100), 0);
+    assertEquals(buf.indexOf(Buffer.from(""), 0, -1), 0);
+  },
+});
+
+Deno.test({
+  name: "[node/buffer] lastIndexOf clamps negative end to 0 for empty needle",
+  fn() {
+    const buf = Buffer.from("abcabc");
+    assertEquals(buf.lastIndexOf("", 5, -1), 0);
+    assertEquals(buf.lastIndexOf(Buffer.from(""), 5, -1), 0);
+  },
+});
+
+// UCS2/utf16le end must round down to an even boundary, matching
+// Node's `search_end &= ~1`. Not covered by upstream for any
+// ucs2/utf16le case that passes an explicit `end`.
+Deno.test({
+  name:
+    "[node/buffer] indexOf rounds odd end down to nearest ucs2 code unit boundary",
+  fn() {
+    const ucs2buf = Buffer.from("abc", "ucs2"); // 6 bytes, 3 code units
+    assertEquals(ucs2buf.indexOf("b", 0, 3, "ucs2"), -1);
+    assertEquals(ucs2buf.indexOf("b", 0, 4, "ucs2"), 2);
+  },
+});
+
+// A forward UCS2 search must align an odd byteOffset down to the code-unit
+// grid, matching Node's `offset / 2`. Not covered by upstream, which only
+// passes even (0) offsets for ucs2.
+Deno.test({
+  name: "[node/buffer] indexOf aligns odd ucs2 byteOffset down to code unit",
+  fn() {
+    assertEquals(Buffer.from("ab", "utf16le").indexOf("a", 1, "utf16le"), 0);
+    assertEquals(Buffer.from("ba", "utf16le").indexOf("a", 1, "utf16le"), 2);
+    assertEquals(
+      Buffer.from("ab", "utf16le").includes("a", 1, "utf16le"),
+      true,
+    );
+  },
+});
+
+// A UCS2 needle with a trailing odd byte must be truncated to whole code
+// units, matching Node's `needle_length / 2`. Not covered by upstream, whose
+// ucs2 needles are all even-length strings.
+Deno.test({
+  name: "[node/buffer] indexOf truncates odd-length ucs2 needle to code units",
+  fn() {
+    const needle = Buffer.from([0x61, 0x00, 0xff]); // "a\0" + stray byte
+    assertEquals(
+      Buffer.from("ab", "utf16le").indexOf(needle, 0, "utf16le"),
+      0,
+    );
+  },
+});
+
+// A fractional byteOffset must be truncated toward zero, matching Node reading
+// it as an int64 at the binding boundary. Not covered by upstream.
+Deno.test({
+  name: "[node/buffer] indexOf/lastIndexOf truncate fractional byteOffset",
+  fn() {
+    const buf = Buffer.from("abcabc");
+    assertEquals(Buffer.from("abc").indexOf(98, 0.5), 1);
+    assertEquals(Buffer.from("abc").indexOf("b", 0.5), 1);
+    assertEquals(buf.lastIndexOf("a", 4.9), 3);
+    assertEquals(buf.lastIndexOf(0x61, 4.9), 3);
   },
 });

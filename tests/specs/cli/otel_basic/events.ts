@@ -1,4 +1,4 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 import { trace } from "npm:@opentelemetry/api@1.9.0";
 
@@ -19,3 +19,7 @@ span3.addEvent("example event", {
   key: "value",
 }, new Date());
 span3.end();
+
+const span4 = tracer.startSpan("example span");
+span4.recordException(new Error("error message"));
+span4.end();

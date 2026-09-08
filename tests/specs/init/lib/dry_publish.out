@@ -1,7 +1,4 @@
-Check file:///[WILDLINE]/mod.ts
-Checking for slow types in the public API...
-Check file:///[WILDLINE]/mod.ts
-error: Failed preparing 'project'.
+error: Invalid package name 'project' in 'file:///[WILDCARD]/project/deno.json'
 
 Caused by:
-    Invalid package name, use '@<scope_name>/<package_name> format
+    package name must use the '@<scope>/<package>' format

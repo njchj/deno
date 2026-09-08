@@ -1,4 +1,4 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 // @ts-check
 
@@ -264,6 +264,79 @@ export class SourceCode {
   }
 
   /**
+   * @returns {Array<Deno.lint.LineComment | Deno.lint.BlockComment>}
+   */
+  getAllComments() {
+    materializeComments(this.#ctx);
+    return this.#ctx.comments;
+  }
+
+  /**
+   * @param {Deno.lint.Node} node
+   * @returns {Array<Deno.lint.LineComment | Deno.lint.BlockComment>}
+   */
+  getCommentsBefore(node) {
+    materializeComments(this.#ctx);
+
+    /** @type {Array<Deno.lint.LineComment | Deno.lint.BlockComment>} */
+    const before = [];
+
+    const { comments } = this.#ctx;
+    for (let i = 0; i < comments.length; i++) {
+      const comment = comments[i];
+      if (comment.range[0] <= node.range[0]) {
+        before.push(comment);
+      }
+    }
+
+    return before;
+  }
+
+  /**
+   * @param {Deno.lint.Node} node
+   * @returns {Array<Deno.lint.LineComment | Deno.lint.BlockComment>}
+   */
+  getCommentsAfter(node) {
+    materializeComments(this.#ctx);
+
+    /** @type {Array<Deno.lint.LineComment | Deno.lint.BlockComment>} */
+    const after = [];
+
+    const { comments } = this.#ctx;
+    for (let i = 0; i < comments.length; i++) {
+      const comment = comments[i];
+      if (comment.range[0] >= node.range[1]) {
+        after.push(comment);
+      }
+    }
+
+    return after;
+  }
+
+  /**
+   * @param {Deno.lint.Node} node
+   * @returns {Array<Deno.lint.LineComment | Deno.lint.BlockComment>}
+   */
+  getCommentsInside(node) {
+    materializeComments(this.#ctx);
+
+    /** @type {Array<Deno.lint.LineComment | Deno.lint.BlockComment>} */
+    const inside = [];
+
+    const { comments } = this.#ctx;
+    for (let i = 0; i < comments.length; i++) {
+      const comment = comments[i];
+      if (
+        comment.range[0] >= node.range[0] && comment.range[1] <= node.range[1]
+      ) {
+        inside.push(comment);
+      }
+    }
+
+    return inside;
+  }
+
+  /**
    * @returns {string}
    */
   #getSource() {
@@ -318,6 +391,12 @@ export class Context {
     const start = range[0];
     const end = range[1];
 
+    if (start > end) {
+      throw new RangeError(
+        `Invalid range. Start value is bigger than end value: [${start}, ${end}]`,
+      );
+    }
+
     /** @type {Deno.lint.Fix[]} */
     const fixes = [];
 
@@ -346,46 +425,83 @@ export class Context {
 }
 
 /**
+ * @param {AstContext} ctx
+ */
+function materializeComments(ctx) {
+  const { buf, commentsOffset, comments, strTable } = ctx;
+
+  let offset = commentsOffset;
+  const count = readU32(buf, offset);
+  offset += 4;
+
+  if (comments.length === count) return;
+
+  while (offset < buf.length && comments.length < count) {
+    const kind = buf[offset];
+    offset++;
+    const spanId = readU32(buf, offset);
+    offset += 4;
+    const strId = readU32(buf, offset);
+    offset += 4;
+
+    comments.push({
+      type: kind === 0 ? "Line" : "Block",
+      range: readSpan(ctx, spanId),
+      value: getString(strTable, strId),
+    });
+  }
+}
+
+/**
  * @param {Deno.lint.Plugin[]} plugins
  * @param {string[]} exclude
+ * @param {string[]} [specifiers] The specifiers each plugin was loaded from,
+ *   parallel to `plugins`, used to make error messages actionable.
  */
-export function installPlugins(plugins, exclude) {
+export function installPlugins(plugins, exclude, specifiers) {
   if (Array.isArray(exclude)) {
     for (let i = 0; i < exclude.length; i++) {
       state.ignoredRules.add(exclude[i]);
     }
   }
 
-  return plugins.map((plugin) => installPlugin(plugin));
+  return plugins.map((plugin, i) => installPlugin(plugin, specifiers?.[i]));
 }
 
 /**
  * @param {Deno.lint.Plugin} plugin
+ * @param {string} [specifier] The specifier the plugin was loaded from, if any.
  */
-function installPlugin(plugin) {
+function installPlugin(plugin, specifier) {
+  // When the plugin was loaded from a specifier (i.e. `lint.plugins` in the
+  // config), prefix validation errors with it so the user knows which plugin
+  // is misbehaving instead of getting an anonymous error.
+  const prefix = typeof specifier === "string"
+    ? `Failed to load lint plugin '${specifier}': `
+    : "";
   if (typeof plugin !== "object") {
-    throw new Error("Linter plugin must be an object");
+    throw new Error(`${prefix}Linter plugin must be an object`);
   }
   if (typeof plugin.name !== "string") {
-    throw new Error("Linter plugin name must be a string");
+    throw new Error(`${prefix}Linter plugin name must be a string`);
   }
   if (!/^[a-z-]+$/.test(plugin.name)) {
     throw new Error(
-      "Linter plugin name must only contain lowercase letters (a-z) or hyphens (-).",
+      `${prefix}Linter plugin name must only contain lowercase letters (a-z) or hyphens (-).`,
     );
   }
   if (plugin.name.startsWith("-") || plugin.name.endsWith("-")) {
     throw new Error(
-      "Linter plugin name must start and end with a lowercase letter.",
+      `${prefix}Linter plugin name must start and end with a lowercase letter.`,
     );
   }
   if (plugin.name.includes("--")) {
     throw new Error(
-      "Linter plugin name must not have consequtive hyphens.",
+      `${prefix}Linter plugin name must not have consequtive hyphens.`,
     );
   }
   if (typeof plugin.rules !== "object") {
-    throw new Error("Linter plugin rules must be an object");
+    throw new Error(`${prefix}Linter plugin rules must be an object`);
   }
   if (state.installedPlugins.has(plugin.name)) {
     throw new Error(`Linter plugin ${plugin.name} has already been registered`);
@@ -489,6 +605,7 @@ class FacadeNode {
 
 /** @type {Set<number>} */
 const appliedGetters = new Set();
+let hasCommenstGetter = false;
 
 /**
  * Add getters for all potential properties found in the message.
@@ -505,6 +622,9 @@ function setNodeGetters(ctx) {
     const name = getString(ctx.strTable, id);
 
     Object.defineProperty(FacadeNode.prototype, name, {
+      // The `parent` key is expected to be non-enumerable.
+      // See the npm `zimmerframe` library.
+      enumerable: name !== "parent",
       get() {
         return readValue(
           this[INTERNAL_CTX],
@@ -512,6 +632,16 @@ function setNodeGetters(ctx) {
           i,
           getNode,
         );
+      },
+    });
+  }
+
+  if (!hasCommenstGetter) {
+    hasCommenstGetter = true;
+    Object.defineProperty(FacadeNode.prototype, "comments", {
+      get() {
+        materializeComments(this[INTERNAL_CTX]);
+        return this[INTERNAL_CTX].comments;
       },
     });
   }
@@ -729,7 +859,12 @@ function readValue(ctx, idx, search, parseNode) {
   } else if (search === AST_PROP_RANGE) {
     return readSpan(ctx, idx);
   } else if (search === AST_PROP_PARENT) {
-    const parent = readParent(buf, idx);
+    let parent = readParent(buf, idx);
+
+    const parentType = readType(buf, parent);
+    if (parentType === AST_GROUP_TYPE) {
+      parent = readParent(buf, parent);
+    }
     return getNode(ctx, parent);
   }
 
@@ -989,6 +1124,7 @@ function createAstContext(buf, token) {
 
   // The buffer has a few offsets at the end which allows us to easily
   // jump to the relevant sections of the message.
+  const commentsOffset = readU32(buf, buf.length - 28);
   const propsOffset = readU32(buf, buf.length - 24);
   const spansOffset = readU32(buf, buf.length - 20);
   const typeMapOffset = readU32(buf, buf.length - 16);
@@ -1055,7 +1191,9 @@ function createAstContext(buf, token) {
     rootOffset,
     spansOffset,
     propsOffset,
+    commentsOffset,
     nodes: new Map(),
+    comments: [],
     strTableOffset,
     strByProp,
     strByType,
@@ -1492,4 +1630,10 @@ function runLintPlugin(plugin, fileName, sourceText) {
   return diagnostics;
 }
 
-Deno.lint.runPlugin = runLintPlugin;
+// `op_lint_create_serialized_ast` is only available in the `deno test`
+// subcommand. In other subcommands that load this module (e.g. the REPL) the op
+// is missing, so keep the stub `Deno.lint.runPlugin` from 99_main.js which
+// throws a helpful error instead of a cryptic "op is not a function".
+if (op_lint_create_serialized_ast) {
+  Deno.lint.runPlugin = runLintPlugin;
+}

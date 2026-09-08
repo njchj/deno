@@ -1,12 +1,24 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 // Copyright Joyent and Node contributors. All rights reserved. MIT license.
 
-// TODO(petamoriken): enable prefer-primordials for node polyfills
-// deno-lint-ignore-file prefer-primordials
-
-import { core, primordials } from "ext:core/mod.js";
-import { validateFunction } from "ext:deno_node/internal/validators.mjs";
-import { newAsyncId } from "ext:deno_node/internal/async_hooks.ts";
+(function () {
+const { core, primordials } = __bootstrap;
+const {
+  validateFunction,
+  validateObject,
+} = core.loadExtScript("ext:deno_node/internal/validators.mjs");
+const {
+  AsyncHook,
+  emitAfter,
+  emitBefore,
+  emitDestroy: emitDestroyHook,
+  emitInit,
+  enterAsyncResource,
+  exitAsyncResource,
+  executionAsyncId: internalExecutionAsyncId,
+  executionAsyncResource: internalExecutionAsyncResource,
+  newAsyncId,
+} = core.loadExtScript("ext:deno_node/internal/async_hooks.ts");
 
 const {
   ObjectDefineProperties,
@@ -14,6 +26,9 @@ const {
   FunctionPrototypeBind,
   ArrayPrototypeUnshift,
   ObjectFreeze,
+  SafeFinalizationRegistry,
+  SafeArrayIterator,
+  Symbol,
 } = primordials;
 
 const {
@@ -22,7 +37,22 @@ const {
   setAsyncContext,
 } = core;
 
-export class AsyncResource {
+// FinalizationRegistry to emit the async hook destroy callback when an
+// AsyncResource is garbage collected, matching Node.js behaviour.
+const asyncResourceRegistry = new SafeFinalizationRegistry(
+  (asyncId: number) => emitDestroyHook(asyncId),
+);
+
+// Two distinct sentinels, because `getStore()` has to tell three states apart
+// without allocating a wrapper for ordinary stores: "no store because we are
+// inside `exit()`", "a store whose value happens to be `undefined`", and "no
+// store at all", which is the only one that falls back to `defaultValue`.
+// Collapsing the first two loses the `disable()` case, where the context still
+// holds the sentinel written by `enterWith(undefined)`.
+const kExitedStore = Symbol("kExitedStore");
+const kUndefinedStore = Symbol("kUndefinedStore");
+
+class AsyncResource {
   type: string;
   #snapshot: unknown;
   #asyncId: number;
@@ -31,6 +61,13 @@ export class AsyncResource {
     this.type = type;
     this.#snapshot = getAsyncContext();
     this.#asyncId = newAsyncId();
+    // Fire the init hook so that async_hooks.createHook({ init }) callbacks
+    // receive this resource, matching Node.js behaviour.
+    emitInit(this.#asyncId, type, internalExecutionAsyncId(), this);
+    // Register with the FinalizationRegistry so emitDestroy is called when
+    // this object is garbage collected. Pass `this` as the unregister token so
+    // emitDestroy() can cancel the finalizer.
+    asyncResourceRegistry.register(this, this.#asyncId, this);
   }
 
   asyncId() {
@@ -43,15 +80,28 @@ export class AsyncResource {
     ...args: unknown[]
   ) {
     const previousContext = getAsyncContext();
+    emitBefore(this.#asyncId);
     try {
       setAsyncContext(this.#snapshot);
-      return ReflectApply(fn, thisArg, args);
+      // Enter this resource as the current executionAsyncResource() so that
+      // user code inside the scope observes `this` as the active resource.
+      const prevResource = enterAsyncResource(this);
+      try {
+        return ReflectApply(fn, thisArg, args);
+      } finally {
+        exitAsyncResource(prevResource);
+      }
     } finally {
       setAsyncContext(previousContext);
+      emitAfter(this.#asyncId);
     }
   }
 
-  emitDestroy() {}
+  emitDestroy() {
+    asyncResourceRegistry.unregister(this);
+    emitDestroyHook(this.#asyncId);
+    return this;
+  }
 
   bind(fn: (...args: unknown[]) => unknown, thisArg) {
     validateFunction(fn, "fn");
@@ -84,18 +134,38 @@ export class AsyncResource {
     thisArg?: AsyncResource,
   ) {
     type = type || fn.name || "bound-anonymous-fn";
+    // deno-lint-ignore deno-internal/prefer-primordials -- `bind` is AsyncResource's own method, not Function.prototype.bind
     return (new AsyncResource(type)).bind(fn, thisArg);
   }
 }
 
-export class AsyncLocalStorage {
+class AsyncLocalStorage {
   #variable = new AsyncVariable();
+  // deno-lint-ignore no-explicit-any
+  #defaultValue: any = undefined;
+  #name = "";
   enabled = false;
+
+  constructor(
+    options: { defaultValue?: unknown; name?: string } = { __proto__: null },
+  ) {
+    validateObject(options, "options");
+    this.#defaultValue = options.defaultValue;
+    if (options.name !== undefined) {
+      this.#name = `${options.name}`;
+    }
+  }
+
+  get name() {
+    return this.#name;
+  }
 
   // deno-lint-ignore no-explicit-any
   run(store: any, callback: any, ...args: any[]): any {
     this.enabled = true;
-    const previous = this.#variable.enter(store);
+    const previous = this.#variable.enter(
+      store === undefined ? kUndefinedStore : store,
+    );
     try {
       return ReflectApply(callback, null, args);
     } finally {
@@ -105,28 +175,35 @@ export class AsyncLocalStorage {
 
   // deno-lint-ignore no-explicit-any
   exit(callback: (...args: unknown[]) => any, ...args: any[]): any {
-    if (!this.enabled) {
-      return ReflectApply(callback, null, args);
-    }
-    this.enabled = false;
+    const previous = this.#variable.enter(kExitedStore);
     try {
       return ReflectApply(callback, null, args);
     } finally {
-      this.enabled = true;
+      setAsyncContext(previous);
     }
   }
 
   // deno-lint-ignore no-explicit-any
   getStore(): any {
-    if (!this.enabled) {
+    const store = this.#variable.get();
+    // `exit()` means "no store", regardless of `enabled` or `defaultValue`.
+    if (store === kExitedStore) {
       return undefined;
     }
-    return this.#variable.get();
+    if (!this.enabled) {
+      return this.#defaultValue;
+    }
+    // A store explicitly set to `undefined` is not the same as no store, so it
+    // must not fall back to `defaultValue`.
+    if (store === kUndefinedStore) {
+      return undefined;
+    }
+    return store === undefined ? this.#defaultValue : store;
   }
 
   enterWith(store: unknown) {
     this.enabled = true;
-    this.#variable.enter(store);
+    this.#variable.enter(store === undefined ? kUndefinedStore : store);
   }
 
   disable() {
@@ -134,30 +211,35 @@ export class AsyncLocalStorage {
   }
 
   static bind(fn: (...args: unknown[]) => unknown) {
+    // deno-lint-ignore deno-internal/prefer-primordials -- `bind` is AsyncResource's own static method, not Function.prototype.bind
     return AsyncResource.bind(fn);
   }
 
   static snapshot() {
-    return AsyncLocalStorage.bind((
+    const resource = new AsyncResource("AsyncLocalStorage.snapshot");
+    return function (
       cb: (...args: unknown[]) => unknown,
       ...args: unknown[]
-    ) => ReflectApply(cb, null, args));
+    ) {
+      return resource.runInAsyncScope(
+        cb,
+        null,
+        ...new SafeArrayIterator(args),
+      );
+    };
   }
 }
 
-export function executionAsyncId() {
+// Re-export executionAsyncId from internal
+const executionAsyncId = internalExecutionAsyncId;
+
+function triggerAsyncId() {
   return 0;
 }
 
-export function triggerAsyncId() {
-  return 0;
-}
+const executionAsyncResource = internalExecutionAsyncResource;
 
-export function executionAsyncResource() {
-  return {};
-}
-
-export const asyncWrapProviders = ObjectFreeze({
+const asyncWrapProviders = ObjectFreeze({
   __proto__: null,
   NONE: 0,
   DIRHANDLE: 1,
@@ -224,24 +306,38 @@ export const asyncWrapProviders = ObjectFreeze({
   VERIFYREQUEST: 62,
 });
 
-class AsyncHook {
-  enable() {
-  }
-
-  disable() {
-  }
+// Use the AsyncHook from the internal module
+function createHook(callbacks: {
+  init?: (
+    asyncId: number,
+    type: string,
+    triggerAsyncId: number,
+    resource: unknown,
+  ) => void;
+  before?: (asyncId: number) => void;
+  after?: (asyncId: number) => void;
+  destroy?: (asyncId: number) => void;
+  promiseResolve?: (asyncId: number) => void;
+}) {
+  return new AsyncHook(callbacks);
 }
 
-export function createHook() {
-  return new AsyncHook();
-}
-
-export default {
+return {
+  default: {
+    AsyncLocalStorage,
+    createHook,
+    executionAsyncId,
+    triggerAsyncId,
+    executionAsyncResource,
+    asyncWrapProviders,
+    AsyncResource,
+  },
   AsyncLocalStorage,
+  AsyncResource,
   createHook,
   executionAsyncId,
   triggerAsyncId,
   executionAsyncResource,
   asyncWrapProviders,
-  AsyncResource,
 };
+})();

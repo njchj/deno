@@ -1,4 +1,4 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 use std::str::FromStr;
 
@@ -609,6 +609,7 @@ static CONTENT_TYPES: phf::Set<&'static [u8]> = phf_set! {
   b"text/uri-list",
   b"text/vcard",
   b"text/vtt",
+  b"text/x-component",
   b"text/x-gwt-rpc",
   b"text/x-jquery-tmpl",
   b"text/x-markdown",
@@ -653,5 +654,7 @@ mod tests {
     assert!(is_content_compressible("application/json"));
     assert!(is_content_compressible("text/plain;charset=UTF-8"));
     assert!(is_content_compressible("text/PlAIn; charset=utf-8"));
+    assert!(is_content_compressible("text/x-component"));
+    assert!(is_content_compressible("text/X-Component; charset=utf-8"));
   }
 }

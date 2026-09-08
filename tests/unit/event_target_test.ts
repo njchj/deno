@@ -1,4 +1,4 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 import { assertEquals, assertThrows } from "./test_util.ts";
 
@@ -130,6 +130,31 @@ Deno.test(function removingNullEventListenerShouldSucceed() {
   assertEquals(document.removeEventListener("x", null, false), undefined);
   assertEquals(document.removeEventListener("x", null, true), undefined);
   assertEquals(document.removeEventListener("x", null), undefined);
+});
+
+Deno.test(function removeEventListenerWithNullOptions() {
+  const target = new EventTarget();
+  let callCount = 0;
+  const listener = () => {
+    ++callCount;
+  };
+
+  // null options should be treated as capture: false
+  target.addEventListener("test", listener);
+  // @ts-expect-error: testing runtime behavior with null (not in TS types but valid per DOM spec)
+  target.removeEventListener("test", listener, null);
+  target.dispatchEvent(new Event("test"));
+  assertEquals(callCount, 0);
+
+  // null options should not remove a capture listener
+  target.addEventListener("test", listener, true);
+  // @ts-expect-error: testing runtime behavior with null (not in TS types but valid per DOM spec)
+  target.removeEventListener("test", listener, null);
+  target.dispatchEvent(new Event("test"));
+  assertEquals(callCount, 1);
+
+  // cleanup
+  target.removeEventListener("test", listener, true);
 });
 
 Deno.test(function constructedEventTargetUseObjectPrototype() {
@@ -318,13 +343,54 @@ Deno.test(function eventTargetDispatchShouldFireCurrentListenersOnly() {
 });
 
 Deno.test(function eventTargetAddEventListenerGlobalAbort() {
-  return new Promise((resolve) => {
+  return new Promise<void>((resolve) => {
     const c = new AbortController();
 
     c.signal.addEventListener("abort", () => resolve());
     addEventListener("test", () => {}, { signal: c.signal });
     c.abort();
   });
+});
+
+Deno.test(function eventTargetManualRemoveCleansAbortSignalListener() {
+  const target = new EventTarget();
+  const controller = new AbortController();
+  const listener = () => {};
+
+  target.addEventListener("test", listener, { signal: controller.signal });
+  target.removeEventListener("test", listener);
+
+  let removeCount = 0;
+  const originalRemoveEventListener = target.removeEventListener;
+  target.removeEventListener = function (...args) {
+    removeCount++;
+    return originalRemoveEventListener.apply(this, args);
+  };
+  controller.abort();
+
+  assertEquals(removeCount, 0);
+});
+
+Deno.test(function eventTargetOnceListenerCleansAbortSignalListener() {
+  const target = new EventTarget();
+  const controller = new AbortController();
+  const listener = () => {};
+
+  target.addEventListener("test", listener, {
+    once: true,
+    signal: controller.signal,
+  });
+  target.dispatchEvent(new Event("test"));
+
+  let removeCount = 0;
+  const originalRemoveEventListener = target.removeEventListener;
+  target.removeEventListener = function (...args) {
+    removeCount++;
+    return originalRemoveEventListener.apply(this, args);
+  };
+  controller.abort();
+
+  assertEquals(removeCount, 0);
 });
 
 Deno.test(function eventTargetBrandChecking() {

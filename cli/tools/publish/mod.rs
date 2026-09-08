@@ -1,51 +1,54 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use deno_ast::ModuleSpecifier;
+use deno_ast::SourceTextInfo;
 use deno_config::deno_json::ConfigFile;
 use deno_config::workspace::JsrPackageConfig;
 use deno_config::workspace::Workspace;
-use deno_core::anyhow::bail;
 use deno_core::anyhow::Context;
+use deno_core::anyhow::bail;
 use deno_core::error::AnyError;
-use deno_core::futures::future::LocalBoxFuture;
-use deno_core::futures::stream::FuturesUnordered;
 use deno_core::futures::FutureExt;
 use deno_core::futures::StreamExt;
+use deno_core::futures::future::LocalBoxFuture;
+use deno_core::futures::stream::FuturesUnordered;
 use deno_core::serde_json;
-use deno_core::serde_json::json;
 use deno_core::serde_json::Value;
+use deno_core::serde_json::json;
 use deno_core::url::Url;
+use deno_resolver::collections::FolderScopedMap;
 use deno_runtime::deno_fetch;
+use deno_semver::Version;
 use deno_terminal::colors;
 use http_body_util::BodyExt;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
-use tokio::process::Command;
 
 use self::diagnostics::PublishDiagnostic;
 use self::diagnostics::PublishDiagnosticsCollector;
+use self::diagnostics::RelativePackageImportDiagnosticReferrer;
 use self::graph::GraphDiagnosticsCollector;
 use self::module_content::ModuleContentProvider;
 use self::paths::CollectedPublishPath;
 use self::tar::PublishableTarball;
-use crate::args::jsr_api_url;
-use crate::args::jsr_url;
 use crate::args::CliOptions;
 use crate::args::Flags;
 use crate::args::PublishFlags;
+use crate::args::jsr_api_url;
+use crate::args::jsr_url;
 use crate::factory::CliFactory;
+use crate::graph_util::CreatePublishGraphOptions;
 use crate::graph_util::ModuleGraphCreator;
 use crate::http_util::HttpClient;
 use crate::registry;
@@ -53,6 +56,7 @@ use crate::tools::lint::collect_no_slow_type_diagnostics;
 use crate::type_checker::CheckOptions;
 use crate::type_checker::TypeChecker;
 use crate::util::display::human_size;
+use crate::util::git::check_if_git_repo_dirty;
 
 mod auth;
 
@@ -64,9 +68,10 @@ mod provenance;
 mod publish_order;
 mod tar;
 mod unfurl;
+mod wasm;
 
-use auth::get_auth_method;
 use auth::AuthMethod;
+use auth::get_auth_method;
 use publish_order::PublishOrderGraph;
 use unfurl::SpecifierUnfurler;
 
@@ -76,18 +81,21 @@ pub async fn publish(
 ) -> Result<(), AnyError> {
   let cli_factory = CliFactory::from_flags(flags);
 
-  let auth_method =
-    get_auth_method(publish_flags.token, publish_flags.dry_run)?;
-
   let cli_options = cli_factory.cli_options()?;
   let directory_path = cli_options.initial_cwd();
   let mut publish_configs = cli_options.start_dir.jsr_packages_for_publish();
   if publish_configs.is_empty() {
-    match cli_options.start_dir.maybe_deno_json() {
+    match cli_options.start_dir.member_deno_json() {
       Some(deno_json) => {
-        debug_assert!(!deno_json.is_package());
+        debug_assert!(!deno_json.is_package() || !deno_json.should_publish());
         if deno_json.json.name.is_none() {
           bail!("Missing 'name' field in '{}'.", deno_json.specifier);
+        }
+        if !deno_json.should_publish() {
+          bail!(
+            "Package 'publish' field is false in '{}'.",
+            deno_json.specifier
+          );
         }
         error_missing_exports_field(deno_json)?;
       }
@@ -102,7 +110,9 @@ pub async fn publish(
 
   if let Some(version) = &publish_flags.set_version {
     if publish_configs.len() > 1 {
-      bail!("Cannot use --set-version when publishing a workspace. Change your cwd to an individual package instead.");
+      bail!(
+        "Cannot use --set-version when publishing a workspace. Change your cwd to an individual package instead."
+      );
     }
     if let Some(publish_config) = publish_configs.get_mut(0) {
       let mut config_file = publish_config.config_file.as_ref().clone();
@@ -111,20 +121,54 @@ pub async fn publish(
     }
   }
 
+  validate_publish_configs(&publish_configs)?;
+
+  let auth_method =
+    get_auth_method(publish_flags.token, publish_flags.dry_run)?;
+
+  // Bail out early if the version is already published, before doing the
+  // expensive type checking and tarball preparation. Already-published
+  // versions are skipped with a warning (rather than erroring) so that
+  // re-running `deno publish` after a partial or concurrent publish still
+  // succeeds, matching the idempotent behavior of the publish step itself.
+  if !publish_flags.dry_run {
+    publish_configs = filter_out_published_packages(
+      &cli_factory.http_client_provider().get_or_create()?,
+      jsr_api_url(),
+      publish_configs,
+    )
+    .await?;
+
+    if publish_configs.is_empty() {
+      log::info!(
+        "{} All packages are already published",
+        colors::green("Success"),
+      );
+      return Ok(());
+    }
+  }
+
   let specifier_unfurler = SpecifierUnfurler::new(
+    cli_factory.node_resolver().await?.clone(),
+    cli_factory.npm_req_resolver().await?.clone(),
+    cli_factory.pkg_json_resolver()?.clone(),
+    cli_factory.cli_options().unwrap().start_dir.clone(),
     cli_factory.workspace_resolver().await?.clone(),
-    cli_options.unstable_bare_node_builtins(),
   );
 
   let diagnostics_collector = PublishDiagnosticsCollector::default();
+  let parsed_source_cache = cli_factory.parsed_source_cache()?;
   let module_content_provider = Arc::new(ModuleContentProvider::new(
-    cli_factory.parsed_source_cache().clone(),
+    parsed_source_cache.clone(),
     specifier_unfurler,
     cli_factory.sys(),
-    cli_factory.tsconfig_resolver()?.clone(),
+    cli_factory.compiler_options_resolver()?.clone(),
   ));
   let publish_preparer = PublishPreparer::new(
-    GraphDiagnosticsCollector::new(cli_factory.parsed_source_cache().clone()),
+    GraphDiagnosticsCollector::new(
+      cli_factory.npm_resolver().await?.clone(),
+      parsed_source_cache.clone(),
+    ),
     cli_factory.module_graph_creator().await?.clone(),
     cli_factory.type_checker().await?.clone(),
     cli_options.clone(),
@@ -149,13 +193,13 @@ pub async fn publish(
     .ok()
     .is_none()
     && !publish_flags.allow_dirty
-  {
-    if let Some(dirty_text) =
+    && let Some(dirty_text) =
       check_if_git_repo_dirty(cli_options.initial_cwd()).await
-    {
-      log::error!("\nUncommitted changes:\n\n{}\n", dirty_text);
-      bail!("Aborting due to uncommitted changes. Check in source code or run with --allow-dirty");
-    }
+  {
+    log::error!("\nUncommitted changes:\n\n{}\n", dirty_text);
+    bail!(
+      "Aborting due to uncommitted changes. Check in source code or run with --allow-dirty"
+    );
   }
 
   if publish_flags.dry_run {
@@ -183,6 +227,79 @@ pub async fn publish(
   .await?;
 
   Ok(())
+}
+
+fn validate_publish_configs(
+  publish_configs: &[JsrPackageConfig],
+) -> Result<(), AnyError> {
+  for config in publish_configs {
+    registry::parse_package_name(&config.name).with_context(|| {
+      format!(
+        "Invalid package name '{}' in '{}'",
+        config.name, config.config_file.specifier
+      )
+    })?;
+
+    let version =
+      config.config_file.json.version.as_deref().ok_or_else(|| {
+        deno_core::anyhow::anyhow!(
+          "{} is missing 'version' field",
+          config.config_file.specifier
+        )
+      })?;
+    Version::parse_standard(version).with_context(|| {
+      format!(
+        "Invalid package version '{}' in '{}'",
+        version, config.config_file.specifier
+      )
+    })?;
+  }
+  Ok(())
+}
+
+/// Queries the registry for each package's version concurrently and returns the
+/// subset of configs whose versions are not yet published. Already-published
+/// versions are reported with a warning and dropped from the returned list.
+async fn filter_out_published_packages(
+  client: &HttpClient,
+  registry_api_url: &Url,
+  publish_configs: Vec<JsrPackageConfig>,
+) -> Result<Vec<JsrPackageConfig>, AnyError> {
+  let checks = publish_configs.iter().map(|config| async move {
+    let Some(version) = config.config_file.json.version.as_deref() else {
+      // a missing version is reported with a better error later on
+      return Ok::<bool, AnyError>(false);
+    };
+    let Ok((scope, package)) = registry::parse_package_name(&config.name)
+    else {
+      // an invalid package name is reported with a better error later on
+      return Ok(false);
+    };
+    registry::check_version_exists(
+      client,
+      registry_api_url,
+      scope,
+      package,
+      version,
+    )
+    .await
+  });
+  let results = deno_core::futures::future::join_all(checks).await;
+
+  let mut remaining = Vec::with_capacity(publish_configs.len());
+  for (config, already_published) in publish_configs.into_iter().zip(results) {
+    if already_published? {
+      log::info!(
+        "{} {}@{}",
+        colors::yellow("Warning: Skipping, already published"),
+        config.name,
+        config.config_file.json.version.as_deref().unwrap_or(""),
+      );
+    } else {
+      remaining.push(config);
+    }
+  }
+  Ok(remaining)
 }
 
 struct PreparedPublishPackage {
@@ -287,10 +404,12 @@ impl PublishPreparer {
     let build_fast_check_graph = !allow_slow_types;
     let graph = self
       .module_graph_creator
-      .create_and_validate_publish_graph(
-        package_configs,
+      .create_publish_graph(CreatePublishGraphOptions {
+        packages: package_configs,
         build_fast_check_graph,
-      )
+        validate_graph: true,
+        skip_unanalyzable_exports: false,
+      })
       .await?;
 
     // todo(dsherret): move to lint rule
@@ -317,7 +436,9 @@ impl PublishPreparer {
         .await
         .is_some()
       {
-        bail!("When using DENO_INTERNAL_FAST_CHECK_OVERWRITE, the git repo must be in a clean state.");
+        bail!(
+          "When using DENO_INTERNAL_FAST_CHECK_OVERWRITE, the git repo must be in a clean state."
+        );
       }
 
       for module in graph.modules() {
@@ -357,20 +478,17 @@ impl PublishPreparer {
       } else {
         // fast check passed, type check the output as a temporary measure
         // until we know that it's reliable and stable
-        let mut diagnostics_by_folder = self
-          .type_checker
-          .check_diagnostics(
-            graph,
-            CheckOptions {
-              build_fast_check_graph: false, // already built
-              lib: self.cli_options.ts_type_lib_window(),
-              reload: self.cli_options.reload_flag(),
-              type_check_mode: self.cli_options.type_check_mode(),
-            },
-          )
-          .await?;
-        // ignore unused parameter diagnostics that may occur due to fast check
-        // not having function body implementations
+        let mut diagnostics_by_folder = self.type_checker.check_diagnostics(
+          graph,
+          CheckOptions {
+            build_fast_check_graph: false, // already built
+            lib: self.cli_options.ts_type_lib_window(),
+            reload: self.cli_options.reload_flag(),
+            type_check_mode: self.cli_options.type_check_mode(),
+          },
+        )?;
+        // ignore unused (type) parameter diagnostics that may occur due to fast
+        // check not having function body implementations
         for result in diagnostics_by_folder.by_ref() {
           let check_diagnostics = result?;
           let check_diagnostics =
@@ -392,7 +510,6 @@ impl PublishPreparer {
     }
   }
 
-  #[allow(clippy::too_many_arguments)]
   async fn prepare_publish(
     &self,
     package: &JsrPackageConfig,
@@ -408,12 +525,7 @@ impl PublishPreparer {
         deno_json.specifier
       )
     })?;
-    let Some(name_no_at) = package.name.strip_prefix('@') else {
-      bail!("Invalid package name, use '@<scope_name>/<package_name> format");
-    };
-    let Some((scope, name_no_scope)) = name_no_at.split_once('/') else {
-      bail!("Invalid package name, use '@<scope_name>/<package_name> format");
-    };
+    let (scope, name_no_scope) = registry::parse_package_name(&package.name)?;
     let file_patterns = package.member_dir.to_publish_config()?.files;
 
     let tarball = deno_core::unsync::spawn_blocking({
@@ -423,6 +535,7 @@ impl PublishPreparer {
       let config_path = config_path.clone();
       let config_url = deno_json.specifier.clone();
       let has_license_field = package.license.is_some();
+      let current_package_name = package.name.clone();
       move || {
         let root_specifier =
           ModuleSpecifier::from_directory_path(&root_dir).unwrap();
@@ -434,9 +547,18 @@ impl PublishPreparer {
             file_patterns,
             force_include_paths: vec![config_path],
           })?;
+        let all_jsr_packages = FolderScopedMap::from_map(
+          cli_options
+            .workspace()
+            .jsr_packages()
+            .map(|pkg| (pkg.member_dir.dir_url().clone(), pkg))
+            .collect(),
+        );
         collect_excluded_module_diagnostics(
           &root_specifier,
           &graph,
+          &current_package_name,
+          &all_jsr_packages,
           &publish_paths,
           &diagnostics_collector,
         );
@@ -500,7 +622,7 @@ impl PublishPreparer {
         .file_name()
         .unwrap()
         .to_string_lossy()
-        .to_string(),
+        .into_owned(),
     }))
   }
 }
@@ -685,38 +807,49 @@ async fn get_auth_headers(
   Ok(authorizations)
 }
 
+#[derive(Debug)]
+struct CreatePackageInfo {
+  scope: String,
+  package: String,
+  create_url: String,
+}
+
 /// Check if both `scope` and `package` already exist, if not return
 /// a URL to the management panel to create them.
+///
+/// The check is authenticated when an authorization is available: the
+/// registry answers 404 for a private package unless the caller has access
+/// to it, so an anonymous check would misreport an existing private package
+/// as missing.
 async fn check_if_scope_and_package_exist(
   client: &HttpClient,
   registry_api_url: &Url,
   registry_manage_url: &Url,
   scope: &str,
   package: &str,
-) -> Result<Option<String>, AnyError> {
-  let mut needs_scope = false;
-  let mut needs_package = false;
-
-  let response = registry::get_scope(client, registry_api_url, scope).await?;
+  authorization: Option<&str>,
+) -> Result<Option<CreatePackageInfo>, AnyError> {
+  let response = registry::get_package(
+    client,
+    registry_api_url,
+    scope,
+    package,
+    authorization,
+  )
+  .await?;
   if response.status() == 404 {
-    needs_scope = true;
-  }
-
-  let response =
-    registry::get_package(client, registry_api_url, scope, package).await?;
-  if response.status() == 404 {
-    needs_package = true;
-  }
-
-  if needs_scope || needs_package {
     let create_url = format!(
       "{}new?scope={}&package={}&from=cli",
       registry_manage_url, scope, package
     );
-    return Ok(Some(create_url));
+    Ok(Some(CreatePackageInfo {
+      create_url,
+      scope: scope.to_string(),
+      package: package.to_string(),
+    }))
+  } else {
+    Ok(None)
   }
-
-  Ok(None)
 }
 
 async fn ensure_scopes_and_packages_exist(
@@ -724,24 +857,46 @@ async fn ensure_scopes_and_packages_exist(
   registry_api_url: &Url,
   registry_manage_url: &Url,
   packages: &[Rc<PreparedPublishPackage>],
+  authorizations: &HashMap<(String, String, String), Rc<str>>,
 ) -> Result<(), AnyError> {
-  if !std::io::stdin().is_terminal() {
-    let mut missing_packages_lines = vec![];
-    for package in packages {
-      let maybe_create_package_url = check_if_scope_and_package_exist(
+  let mut futures = FuturesUnordered::new();
+
+  for package in packages {
+    let authorization = authorizations.get(&(
+      package.scope.clone(),
+      package.package.clone(),
+      package.version.clone(),
+    ));
+    let future = async move {
+      let maybe_create_package_info = check_if_scope_and_package_exist(
         client,
         registry_api_url,
         registry_manage_url,
         &package.scope,
         &package.package,
+        authorization.map(|a| a.as_ref()),
       )
       .await?;
+      Ok::<_, AnyError>(
+        maybe_create_package_info.map(|info| (info, authorization)),
+      )
+    };
+    futures.push(future);
+  }
 
-      if let Some(create_package_url) = maybe_create_package_url {
-        missing_packages_lines.push(format!(" - {}", create_package_url));
-      }
-    }
+  let mut missing_packages = vec![];
 
+  while let Some(maybe_create_package_info) = futures.next().await {
+    if let Some(create_package_info) = maybe_create_package_info? {
+      missing_packages.push(create_package_info);
+    };
+  }
+
+  if !std::io::stdin().is_terminal() {
+    let missing_packages_lines: Vec<_> = missing_packages
+      .into_iter()
+      .map(|(info, _)| format!("- {}", info.create_url))
+      .collect();
     if !missing_packages_lines.is_empty() {
       bail!(
         "Following packages don't exist, follow the links and create them:\n{}",
@@ -751,41 +906,32 @@ async fn ensure_scopes_and_packages_exist(
     return Ok(());
   }
 
-  for package in packages {
-    let maybe_create_package_url = check_if_scope_and_package_exist(
-      client,
-      registry_api_url,
-      registry_manage_url,
-      &package.scope,
-      &package.package,
-    )
-    .await?;
-
-    let Some(create_package_url) = maybe_create_package_url else {
-      continue;
-    };
-
+  for (create_package_info, authorization) in missing_packages {
     ring_bell();
     log::warn!(
       "'@{}/{}' doesn't exist yet. Visit {} to create the package",
-      &package.scope,
-      &package.package,
-      colors::cyan_with_underline(&create_package_url)
+      &create_package_info.scope,
+      &create_package_info.package,
+      colors::cyan_with_underline(&create_package_info.create_url)
     );
     log::warn!("{}", colors::gray("Waiting..."));
-    let _ = open::that_detached(&create_package_url);
-
-    let package_api_url = registry::get_package_api_url(
-      registry_api_url,
-      &package.scope,
-      &package.package,
-    );
+    let _ = open::that_detached(&create_package_info.create_url);
 
     loop {
       tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-      let response = client.get(package_api_url.parse()?)?.send().await?;
+      let response = registry::get_package(
+        client,
+        registry_api_url,
+        &create_package_info.scope,
+        &create_package_info.package,
+        authorization.map(|a| a.as_ref()),
+      )
+      .await?;
       if response.status() == 200 {
-        let name = format!("@{}/{}", package.scope, package.package);
+        let name = format!(
+          "@{}/{}",
+          create_package_info.scope, create_package_info.package
+        );
         log::info!("Package {} created", colors::green(name));
         break;
       }
@@ -810,21 +956,30 @@ async fn perform_publish(
     .cloned()
     .collect::<Vec<_>>();
 
-  ensure_scopes_and_packages_exist(
-    http_client,
-    registry_api_url,
-    registry_url,
-    &packages,
-  )
-  .await?;
-
+  // Authenticate before checking which packages exist: the registry hides
+  // private packages from unauthenticated callers (they 404), so the
+  // existence check must be able to send the authorization the publish will
+  // use.
   let mut authorizations =
     get_auth_headers(http_client, registry_api_url, &packages, auth_method)
       .await?;
 
   assert_eq!(prepared_package_by_name.len(), authorizations.len());
+
+  ensure_scopes_and_packages_exist(
+    http_client,
+    registry_api_url,
+    registry_url,
+    &packages,
+    &authorizations,
+  )
+  .await?;
   let mut futures: FuturesUnordered<LocalBoxFuture<Result<String, AnyError>>> =
     Default::default();
+  // Collect the errors of any packages that failed to publish so that we can
+  // keep publishing the remaining (independent) packages instead of aborting on
+  // the first failure, then report all of them at the end.
+  let mut errors: Vec<AnyError> = Vec::new();
   loop {
     let next_batch = publish_order_graph.next();
 
@@ -853,14 +1008,14 @@ async fn perform_publish(
       futures.push(
         async move {
           let display_name = package.display_name();
-          publish_package(
+          Box::pin(publish_package(
             http_client,
             package,
             registry_api_url,
             registry_url,
             &authorization,
             provenance,
-          )
+          ))
           .await
           .with_context(|| format!("Failed to publish {}", display_name))?;
           Ok(package_name)
@@ -870,16 +1025,68 @@ async fn perform_publish(
     }
 
     let Some(result) = futures.next().await else {
-      // done, ensure no circular dependency
+      // Done. This `?` is reached with packages still pending only when a
+      // package failed above and its dependents stayed blocked (we don't
+      // `finish_package` a failure). That's safe and won't swallow the
+      // collected errors: `ensure_no_pending` runs the cycle check on the
+      // static package graph, so blocked-but-acyclic dependents return `Ok` and
+      // a genuine circular dependency still surfaces here.
       publish_order_graph.ensure_no_pending()?;
       break;
     };
 
-    let package_name = result?;
-    publish_order_graph.finish_package(&package_name);
+    match result {
+      Ok(package_name) => publish_order_graph.finish_package(&package_name),
+      // Record the failure (preserving its context chain) and keep going so
+      // that the other in-flight and queued packages are still published. We
+      // intentionally don't call `finish_package` here: packages that depend on
+      // the one that failed must not be published against a missing version.
+      Err(err) => errors.push(err),
+    }
   }
 
-  Ok(())
+  if errors.is_empty() {
+    Ok(())
+  } else {
+    // Any packages still left in `prepared_package_by_name` were never
+    // attempted because they depended (directly or transitively) on a package
+    // that failed to publish, so their dependency version never became
+    // available. Surface them so the skip isn't silent.
+    if !prepared_package_by_name.is_empty() {
+      let mut skipped = prepared_package_by_name
+        .values()
+        .map(|p| p.display_name())
+        .collect::<Vec<_>>();
+      skipped.sort();
+      log::warn!(
+        "{} Skipped publishing {} package(s) that depended on a package that failed to publish:\n{}",
+        colors::yellow("Warning"),
+        skipped.len(),
+        skipped
+          .iter()
+          .map(|name| format!("  {}", name))
+          .collect::<Vec<_>>()
+          .join("\n"),
+      );
+    }
+    Err(combine_publish_errors(errors))
+  }
+}
+
+/// Combines the errors collected while publishing multiple packages into a
+/// single error, preserving each error's context chain.
+fn combine_publish_errors(mut errors: Vec<AnyError>) -> AnyError {
+  if errors.len() == 1 {
+    return errors.remove(0);
+  }
+
+  let mut message = format!("Failed to publish {} packages:", errors.len());
+  for err in &errors {
+    // `{:#}` renders the full anyhow context chain (e.g.
+    // "Failed to publish @scope/name: <cause>").
+    message.push_str(&format!("\n\n* {:#}", err));
+  }
+  deno_core::anyhow::anyhow!(message)
 }
 
 async fn publish_package(
@@ -898,18 +1105,18 @@ async fn publish_package(
     package.version
   );
 
-  let url = format!(
-    "{}scopes/{}/packages/{}/versions/{}?config=/{}",
+  let config_path = format!("/{}", package.config);
+  let url = registry::get_package_version_api_url(
     registry_api_url,
-    package.scope,
-    package.package,
-    package.version,
-    package.config
-  );
+    &package.scope,
+    &package.package,
+    &package.version,
+    Some(&config_path),
+  )?;
 
   let body = deno_fetch::ReqBody::full(package.tarball.bytes.clone());
   let response = http_client
-    .post(url.parse()?, body)?
+    .post(url, body)?
     .header(
       http::header::AUTHORIZATION,
       authorization.parse().map_err(http::Error::from)?,
@@ -949,14 +1156,9 @@ async fn publish_package(
       );
       task
     }
-    Err(err) => {
-      return Err(err).with_context(|| {
-        format!(
-          "Failed to publish @{}/{} at {}",
-          package.scope, package.package, package.version
-        )
-      })
-    }
+    // The caller wraps every failure with a "Failed to publish <name>@<version>"
+    // context, so inner messages here avoid repeating that prefix.
+    Err(err) => return Err(err.into()),
   };
 
   let interval = std::time::Duration::from_secs(2);
@@ -983,14 +1185,9 @@ async fn publish_package(
   }
 
   if let Some(error) = task.error {
-    bail!(
-      "{} @{}/{} at {}: {}",
-      colors::red("Failed to publish"),
-      package.scope,
-      package.package,
-      package.version,
-      error.message
-    );
+    // The caller adds the "Failed to publish <name>@<version>" context, so only
+    // surface the registry's error message here to avoid a doubled prefix.
+    bail!("{}", error.message);
   }
 
   let enable_provenance = std::env::var("DISABLE_JSR_PROVENANCE").is_err()
@@ -1004,11 +1201,27 @@ async fn publish_package(
       package.scope, package.package, package.version
     ))?;
 
-    let resp = http_client.get(meta_url)?.send().await?;
+    let resp = http_client
+      .get(meta_url.clone())?
+      .send()
+      .await
+      .with_context(|| {
+        format!("Failed to fetch package manifest from {meta_url}")
+      })?;
+    let status = resp.status();
     let meta_bytes = resp.collect().await?.to_bytes();
 
     if std::env::var("DISABLE_JSR_MANIFEST_VERIFICATION_FOR_TESTING").is_err() {
-      verify_version_manifest(&meta_bytes, &package)?;
+      if !status.is_success() {
+        bail!(
+          "Failed to fetch package manifest from {meta_url}: status {status}\n\n{}",
+          response_body_snippet(&meta_bytes),
+        );
+      }
+
+      verify_version_manifest(&meta_bytes, &package).with_context(|| {
+        format!("Failed to verify package manifest from {meta_url}")
+      })?;
     }
 
     let subject = provenance::Subject {
@@ -1021,26 +1234,46 @@ async fn publish_package(
       },
     };
     let bundle =
-      provenance::generate_provenance(http_client, vec![subject]).await?;
+      Box::pin(provenance::generate_provenance(http_client, vec![subject]))
+        .await?;
 
-    let tlog_entry = &bundle.verification_material.tlog_entries[0];
-    log::info!("{}",
-      colors::green(format!(
-        "Provenance transparency log available at https://search.sigstore.dev/?logIndex={}",
-        tlog_entry.log_index
-      ))
-     );
+    let log_index = bundle.verification_material.tlog_entries[0].log_index;
+    let transparency_log =
+      format!("https://search.sigstore.dev/?logIndex={log_index}");
 
     // Submit bundle to JSR
-    let provenance_url = format!(
-      "{}scopes/{}/packages/{}/versions/{}/provenance",
-      registry_api_url, package.scope, package.package, package.version
-    );
-    http_client
-      .post_json(provenance_url.parse()?, &json!({ "bundle": bundle }))?
-      .header(http::header::AUTHORIZATION, authorization.parse()?)
-      .send()
-      .await?;
+    let provenance_url = registry::get_package_version_provenance_api_url(
+      registry_api_url,
+      &package.scope,
+      &package.package,
+      &package.version,
+    )?;
+    match submit_provenance_bundle(
+      http_client,
+      &provenance_url,
+      authorization,
+      &bundle,
+    )
+    .await
+    {
+      Ok(()) => log::info!(
+        "{}",
+        colors::green(format!(
+          "Provenance transparency log available at {transparency_log}"
+        ))
+      ),
+      // The version is already published and immutable at this point, so a
+      // registry-side failure must not turn a successful release into a failed
+      // command. Say plainly what did not happen instead.
+      Err(err) => log::warn!(
+        "{} {:#}\n  The package was published, but it will not show a provenance badge.\n  The attestation itself was signed and is in the transparency log at {}",
+        colors::yellow(
+          "Warning: the registry did not accept the provenance attestation:"
+        ),
+        err,
+        transparency_log,
+      ),
+    }
   }
 
   log::info!(
@@ -1062,8 +1295,10 @@ async fn publish_package(
 }
 
 fn collect_excluded_module_diagnostics(
-  root: &ModuleSpecifier,
+  root_dir: &ModuleSpecifier,
   graph: &deno_graph::ModuleGraph,
+  current_package_name: &str,
+  all_jsr_packages: &FolderScopedMap<JsrPackageConfig>,
   publish_paths: &[CollectedPublishPath],
   diagnostics_collector: &PublishDiagnosticsCollector,
 ) {
@@ -1081,12 +1316,66 @@ fn collect_excluded_module_diagnostics(
       | deno_graph::Module::Node(_)
       | deno_graph::Module::External(_) => None,
     })
-    .filter(|s| s.as_str().starts_with(root.as_str()));
+    .filter(|s| s.as_str().starts_with(root_dir.as_str()));
+  let mut outside_specifiers = Vec::new();
+  let mut had_excluded_specifier = false;
   for specifier in graph_specifiers {
     if !publish_specifiers.contains(specifier) {
-      diagnostics_collector.push(PublishDiagnostic::ExcludedModule {
-        specifier: specifier.clone(),
-      });
+      let other_jsr_pkg = all_jsr_packages
+        .get_for_specifier(specifier)
+        .filter(|pkg| pkg.member_dir.dir_url().as_ref() != root_dir);
+      match other_jsr_pkg {
+        Some(other_jsr_pkg) => {
+          outside_specifiers.push((specifier, other_jsr_pkg));
+        }
+        None => {
+          had_excluded_specifier = true;
+          diagnostics_collector.push(PublishDiagnostic::ExcludedModule {
+            specifier: specifier.clone(),
+          })
+        }
+      }
+    }
+  }
+
+  if !had_excluded_specifier {
+    // ensure no path being published references another package
+    // via a relative import
+    for publish_path in publish_paths {
+      let Some(module) = graph.get(&publish_path.specifier) else {
+        continue;
+      };
+      for (specifier_text, dep) in module.dependencies() {
+        if !deno_path_util::is_relative_specifier(specifier_text) {
+          continue;
+        }
+        let resolutions =
+          dep.maybe_code.ok().into_iter().chain(dep.maybe_type.ok());
+        let mut maybe_res = resolutions.filter_map(|r| {
+          let pkg = all_jsr_packages.get_for_specifier(&r.specifier)?;
+          if pkg.member_dir.dir_url().as_ref() != root_dir {
+            Some((r, pkg))
+          } else {
+            None
+          }
+        });
+        if let Some((outside_res, package)) = maybe_res.next() {
+          diagnostics_collector.push(
+            PublishDiagnostic::RelativePackageImport {
+              // Wasm modules won't have a referrer
+              maybe_referrer: module.source().cloned().map(|source| {
+                RelativePackageImportDiagnosticReferrer {
+                  referrer: outside_res.range.clone(),
+                  text_info: SourceTextInfo::new(source),
+                }
+              }),
+              from_package_name: current_package_name.to_string(),
+              to_package_name: package.name.clone(),
+              specifier: outside_res.specifier.clone(),
+            },
+          );
+        }
+      }
     }
   }
 }
@@ -1102,11 +1391,80 @@ struct VersionManifest {
   exports: HashMap<String, String>,
 }
 
+/// Submit a signed provenance bundle to the registry, erroring on any response
+/// that is not a success.
+///
+/// The response used to be discarded entirely, so a registry that rejected
+/// every attestation looked identical to one that accepted them: publishes kept
+/// reporting a transparency-log entry and success while no package gained a
+/// provenance badge. That is how jsr-io/jsr#1474 went unnoticed for a month.
+async fn submit_provenance_bundle(
+  http_client: &HttpClient,
+  provenance_url: &Url,
+  authorization: &str,
+  bundle: &provenance::ProvenanceBundle,
+) -> Result<(), AnyError> {
+  let response = http_client
+    .post_json(provenance_url.clone(), &json!({ "bundle": bundle }))?
+    .header(http::header::AUTHORIZATION, authorization.parse()?)
+    .send()
+    .await?;
+
+  let status = response.status();
+  if status.is_success() {
+    return Ok(());
+  }
+
+  // Carried into the error so that a report of this warning is traceable in the
+  // registry's own logs, which is where the reason for a rejection lives.
+  let x_deno_ray = response
+    .headers()
+    .get("x-deno-ray")
+    .and_then(|value| value.to_str().ok())
+    .map(|s| s.to_string());
+
+  // The endpoint answers 204 with an empty body on success, so there is nothing
+  // to deserialize; on failure the body is the registry's JSON error, which
+  // `ApiError` renders as "<message> (<code>)".
+  let body = response.collect().await?.to_bytes();
+  match serde_json::from_slice::<registry::ApiError>(&body) {
+    Ok(mut err) => {
+      err.x_deno_ray = x_deno_ray;
+      Err(err.into())
+    }
+    Err(_) => bail!("{}: {}", status, response_body_snippet(&body)),
+  }
+}
+
+/// Returns a truncated, lossy UTF-8 rendering of a response body for use in
+/// error messages, so that a non-JSON response (e.g. an HTML error page) is
+/// diagnosable instead of surfacing as an opaque deserialization error.
+fn response_body_snippet(bytes: &[u8]) -> String {
+  const MAX_LEN: usize = 512;
+  let text = String::from_utf8_lossy(bytes);
+  let text = text.trim();
+  if text.len() > MAX_LEN {
+    let mut end = MAX_LEN;
+    while !text.is_char_boundary(end) {
+      end -= 1;
+    }
+    format!("{}... (truncated)", &text[..end])
+  } else {
+    text.to_string()
+  }
+}
+
 fn verify_version_manifest(
   meta_bytes: &[u8],
   package: &PreparedPublishPackage,
 ) -> Result<(), AnyError> {
-  let manifest = serde_json::from_slice::<VersionManifest>(meta_bytes)?;
+  let manifest = serde_json::from_slice::<VersionManifest>(meta_bytes)
+    .with_context(|| {
+      format!(
+        "Failed to parse package manifest as JSON. Response body:\n\n{}",
+        response_body_snippet(meta_bytes),
+      )
+    })?;
   // Check that nothing was removed from the manifest.
   if manifest.manifest.len() != package.tarball.files.len() {
     bail!(
@@ -1158,46 +1516,19 @@ fn verify_version_manifest(
   Ok(())
 }
 
-async fn check_if_git_repo_dirty(cwd: &Path) -> Option<String> {
-  let bin_name = if cfg!(windows) { "git.exe" } else { "git" };
-
-  //  Check if git exists
-  let git_exists = Command::new(bin_name)
-    .arg("--version")
-    .stderr(Stdio::null())
-    .stdout(Stdio::null())
-    .status()
-    .await
-    .is_ok_and(|status| status.success());
-
-  if !git_exists {
-    return None; // Git is not installed
-  }
-
-  // Check if there are uncommitted changes
-  let output = Command::new(bin_name)
-    .current_dir(cwd)
-    .args(["status", "--porcelain"])
-    .output()
-    .await
-    .expect("Failed to execute command");
-
-  let output_str = String::from_utf8_lossy(&output.stdout);
-  let text = output_str.trim();
-  if text.is_empty() {
-    None
-  } else {
-    Some(text.to_string())
-  }
-}
-
-static SUPPORTED_LICENSE_FILE_NAMES: [&str; 6] = [
+static SUPPORTED_LICENSE_FILE_NAMES: [&str; 12] = [
   "LICENSE",
   "LICENSE.md",
   "LICENSE.txt",
   "LICENCE",
   "LICENCE.md",
   "LICENCE.txt",
+  "COPYING",
+  "COPYING.md",
+  "COPYING.txt",
+  "COPYING.LESSER",
+  "COPYING.LESSER.md",
+  "COPYING.LESSER.txt",
 ];
 
 fn resolve_license_file(
@@ -1269,7 +1600,7 @@ fn error_missing_exports_field(deno_json: &ConfigFile) -> Result<(), AnyError> {
   );
 }
 
-#[allow(clippy::print_stderr)]
+#[allow(clippy::print_stderr, reason = "actually want to output")]
 fn ring_bell() {
   // ASCII code for the bell character.
   eprint!("\x07");

@@ -1,8 +1,71 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 use super::fmt::format_test_error;
 use super::fmt::to_relative_path_or_remote_url;
 use super::*;
+
+/// Step results are tallied into the summary only once the owning (root) test
+/// produces a terminal result. This lets a retried attempt's step results be
+/// discarded instead of counted, while the steps are still printed live as they
+/// run. Keyed by the root test id.
+pub(super) type PendingStepTally =
+  HashMap<usize, Vec<(TestStepResult, Option<TestFailureDescription>)>>;
+
+/// Buffers a step result for its root test instead of tallying it immediately.
+pub(super) fn record_step_result(
+  pending: &mut PendingStepTally,
+  desc: &TestStepDescription,
+  result: &TestStepResult,
+  tests: &IndexMap<usize, TestDescription>,
+  test_steps: &IndexMap<usize, TestStepDescription>,
+) {
+  let failure_desc = match result {
+    TestStepResult::Failed(_) => Some(TestFailureDescription {
+      id: desc.id,
+      name: format_test_step_ancestry(desc, tests, test_steps),
+      origin: desc.origin.clone(),
+      location: desc.location.clone(),
+    }),
+    _ => None,
+  };
+  pending
+    .entry(desc.root_id)
+    .or_default()
+    .push((result.clone(), failure_desc));
+}
+
+/// Commits the buffered step results for a root test into the summary. Called
+/// when the test produces its terminal result.
+pub(super) fn commit_step_results(
+  pending: &mut PendingStepTally,
+  summary: &mut TestSummary,
+  root_id: usize,
+) {
+  let Some(steps) = pending.remove(&root_id) else {
+    return;
+  };
+  for (result, failure_desc) in steps {
+    match result {
+      TestStepResult::Ok => summary.passed_steps += 1,
+      TestStepResult::Ignored => summary.ignored_steps += 1,
+      TestStepResult::Failed(failure) => {
+        summary.failed_steps += 1;
+        if let Some(failure_desc) = failure_desc {
+          summary.failures.push((failure_desc, failure));
+        }
+      }
+    }
+  }
+}
+
+/// Discards the buffered step results for a root test that is being retried, so
+/// the failed attempt's steps don't count toward the summary.
+pub(super) fn discard_step_results(
+  pending: &mut PendingStepTally,
+  root_id: usize,
+) {
+  pending.remove(&root_id);
+}
 
 pub(super) fn format_test_step_ancestry(
   desc: &TestStepDescription,
@@ -93,11 +156,71 @@ pub(super) fn report_sigint(
     "\n{} The following tests were pending:\n",
     colors::intense_blue("SIGINT")
   )
-  .unwrap();
+  .ok();
   for entry in formatted_pending {
-    writeln!(writer, "{}", entry).unwrap();
+    writeln!(writer, "{}", entry).ok();
   }
-  writeln!(writer).unwrap();
+  writeln!(writer).ok();
+}
+
+pub(super) fn report_exit(
+  writer: &mut dyn std::io::Write,
+  cwd: &Url,
+  exit_code: i32,
+  tests_pending: &HashSet<usize>,
+  tests: &IndexMap<usize, TestDescription>,
+  test_steps: &IndexMap<usize, TestStepDescription>,
+) {
+  writeln!(
+    writer,
+    "\n{} A test called Deno.exit({}) while the exit sanitizer was disabled (sanitizeExit: false). Aborting the test run.",
+    colors::yellow("warning"),
+    exit_code,
+  )
+  .ok();
+
+  if tests_pending.is_empty() {
+    writeln!(writer).ok();
+    return;
+  }
+
+  let mut formatted_pending = BTreeSet::new();
+  for id in tests_pending {
+    if let Some(desc) = tests.get(id) {
+      formatted_pending.insert(format_test_for_summary(cwd, &desc.into()));
+    }
+    if let Some(desc) = test_steps.get(id) {
+      formatted_pending
+        .insert(format_test_step_for_summary(cwd, desc, tests, test_steps));
+    }
+  }
+  writeln!(writer, "\nThe following tests were pending:\n").ok();
+  for entry in formatted_pending {
+    writeln!(writer, "{}", entry).ok();
+  }
+  writeln!(writer).ok();
+}
+
+pub(super) fn report_isolate_exit(
+  writer: &mut dyn std::io::Write,
+  cwd: &Url,
+  origin: &str,
+  exit_code: i32,
+) {
+  let location = to_relative_path_or_remote_url(cwd, origin);
+  let label = if exit_code == 0 {
+    colors::yellow("note")
+  } else {
+    colors::red("error")
+  };
+  writeln!(
+    writer,
+    "\n{} {} called `Deno.exit({})` from outside any test. The isolate was terminated; remaining test files will continue.",
+    label,
+    location,
+    exit_code,
+  )
+  .ok();
 }
 
 pub(super) fn report_summary(
@@ -108,7 +231,10 @@ pub(super) fn report_summary(
   options: &TestFailureFormatOptions,
 ) {
   if !summary.failures.is_empty() || !summary.uncaught_errors.is_empty() {
-    #[allow(clippy::type_complexity)] // Type alias doesn't look better here
+    #[allow(
+      clippy::type_complexity,
+      reason = "Type alias doesn't look better here"
+    )]
     let mut failures_by_origin: BTreeMap<
       String,
       (
@@ -131,20 +257,20 @@ pub(super) fn report_summary(
     }
 
     // note: the trailing whitespace is intentional to get a red background
-    writeln!(writer, "\n{}\n", colors::white_bold_on_red(" ERRORS ")).unwrap();
+    writeln!(writer, "\n{}\n", colors::white_bold_on_red(" ERRORS ")).ok();
     for (origin, (failures, uncaught_error)) in failures_by_origin {
       for (description, failure) in failures {
         if !failure.hide_in_summary() {
           let failure_title = format_test_for_summary(cwd, description);
-          writeln!(writer, "{}", &failure_title).unwrap();
+          writeln!(writer, "{}", &failure_title).ok();
           writeln!(
             writer,
             "{}: {}",
             colors::red_bold("error"),
             failure.format(options)
           )
-          .unwrap();
-          writeln!(writer).unwrap();
+          .ok();
+          writeln!(writer).ok();
           failure_titles.push(failure_title);
         }
       }
@@ -153,24 +279,61 @@ pub(super) fn report_summary(
           "{} (uncaught error)",
           to_relative_path_or_remote_url(cwd, &origin)
         );
-        writeln!(writer, "{}", &failure_title).unwrap();
+        writeln!(writer, "{}", &failure_title).ok();
         writeln!(
           writer,
           "{}: {}",
           colors::red_bold("error"),
           format_test_error(js_error, options)
         )
-        .unwrap();
-        writeln!(writer, "This error was not caught from a test and caused the test runner to fail on the referenced module.").unwrap();
-        writeln!(writer, "It most likely originated from a dangling promise, event/timeout handler or top-level code.").unwrap();
-        writeln!(writer).unwrap();
+        .ok();
+        writeln!(writer, "This error was not caught from a test and caused the test runner to fail on the referenced module.").ok();
+        writeln!(writer, "It most likely originated from a dangling promise, event/timeout handler or top-level code.").ok();
+        writeln!(writer).ok();
         failure_titles.push(failure_title);
       }
     }
     // note: the trailing whitespace is intentional to get a red background
-    writeln!(writer, "{}\n", colors::white_bold_on_red(" FAILURES ")).unwrap();
+    writeln!(writer, "{}\n", colors::white_bold_on_red(" FAILURES ")).ok();
     for failure_title in failure_titles {
-      writeln!(writer, "{failure_title}").unwrap();
+      writeln!(writer, "{failure_title}").ok();
+    }
+  }
+
+  if summary.snapshots_updated > 0 {
+    writeln!(
+      writer,
+      "\n{}",
+      colors::green_bold(format!(
+        " > {} {} updated.",
+        summary.snapshots_updated,
+        if summary.snapshots_updated == 1 {
+          "snapshot"
+        } else {
+          "snapshots"
+        }
+      ))
+    )
+    .ok();
+  }
+  if !summary.snapshots_removed.is_empty() {
+    writeln!(
+      writer,
+      "\n{}",
+      colors::red_bold(format!(
+        " > {} {} removed.",
+        summary.snapshots_removed.len(),
+        if summary.snapshots_removed.len() == 1 {
+          "snapshot"
+        } else {
+          "snapshots"
+        }
+      ))
+    )
+    .ok();
+    for snapshot_name in &summary.snapshots_removed {
+      writeln!(writer, "{}", colors::red(format!("   • {}", snapshot_name)))
+        .ok();
     }
   }
 
@@ -200,7 +363,11 @@ pub(super) fn report_summary(
     summary.failed,
     get_steps_text(summary.failed_steps),
   )
-  .unwrap();
+  .ok();
+
+  if summary.flaky > 0 {
+    write!(summary_result, " | {} flaky", summary.flaky).ok();
+  }
 
   let ignored_steps = get_steps_text(summary.ignored_steps);
   if summary.ignored > 0 || !ignored_steps.is_empty() {
@@ -209,23 +376,29 @@ pub(super) fn report_summary(
       " | {} ignored{}",
       summary.ignored, ignored_steps
     )
-    .unwrap()
+    .ok();
   }
 
   if summary.measured > 0 {
-    write!(summary_result, " | {} measured", summary.measured,).unwrap();
+    write!(summary_result, " | {} measured", summary.measured,).ok();
   }
 
   if summary.filtered_out > 0 {
-    write!(summary_result, " | {} filtered out", summary.filtered_out).unwrap()
+    write!(summary_result, " | {} filtered out", summary.filtered_out).ok();
   };
 
+  // The summary is a whole-suite aggregate, so it stays at millisecond
+  // granularity. Sub-millisecond precision here would be noise and would make
+  // the output non-deterministic for fast or empty runs.
   writeln!(
     writer,
     "\n{} | {} {}",
     status,
     summary_result,
-    colors::gray(format!("({})", display::human_elapsed(elapsed.as_millis()))),
+    colors::gray(format!(
+      "({})",
+      display::human_elapsed_with_ms_limit(elapsed.as_millis(), 1_000)
+    )),
   )
-  .unwrap();
+  .ok();
 }

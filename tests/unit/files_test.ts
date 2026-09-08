@@ -1,4 +1,4 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 import {
   assert,
@@ -10,6 +10,43 @@ import { copy } from "@std/io/copy";
 
 // Note tests for Deno.FsFile.setRaw is in integration tests.
 
+function changingCreateOptions(): Deno.OpenOptions {
+  let writeReads = 0;
+  return {
+    read: false,
+    create: true,
+    get write() {
+      // Validation reads this getter twice before the op converts the options.
+      writeReads++;
+      return writeReads <= 2;
+    },
+  };
+}
+
+Deno.test(
+  { permissions: { read: true, write: false } },
+  function openSyncChangingOptionsChecksConvertedAccess() {
+    const path = `open_sync_changing_options_${crypto.randomUUID()}`;
+
+    assertThrows(
+      () => Deno.openSync(path, changingCreateOptions()),
+      Deno.errors.NotCapable,
+    );
+  },
+);
+
+Deno.test(
+  { permissions: { read: true, write: false } },
+  async function openChangingOptionsChecksConvertedAccess() {
+    const path = `open_changing_options_${crypto.randomUUID()}`;
+
+    await assertRejects(
+      () => Deno.open(path, changingCreateOptions()),
+      Deno.errors.NotCapable,
+    );
+  },
+);
+
 Deno.test(function filesStdioFileDescriptors() {
   // @ts-ignore `Deno.stdin.rid` was soft-removed in Deno 2.
   assertEquals(Deno.stdin.rid, 0);
@@ -17,6 +54,19 @@ Deno.test(function filesStdioFileDescriptors() {
   assertEquals(Deno.stdout.rid, 1);
   // @ts-ignore `Deno.stderr.rid` was soft-removed in Deno 2.
   assertEquals(Deno.stderr.rid, 2);
+});
+
+Deno.test(function fsFileGlobalSymbolCannotConstruct() {
+  const FsFileCtor = Deno.FsFile as unknown as new (
+    rid: number,
+    token: symbol,
+  ) => Deno.FsFile;
+
+  assertThrows(
+    () => new FsFileCtor(0, Symbol.for("Deno.internal.FsFile")),
+    TypeError,
+    "'Deno.FsFile' cannot be constructed",
+  );
 });
 
 Deno.test(
@@ -33,7 +83,7 @@ Deno.test(
 
 Deno.test(
   {
-    permissions: { read: true, write: true },
+    permissions: { read: true, write: true, sys: ["umask"] },
   },
   function openSyncMode() {
     const path = Deno.makeTempDirSync() + "/test_openSync.txt";
@@ -51,7 +101,7 @@ Deno.test(
 
 Deno.test(
   {
-    permissions: { read: true, write: true },
+    permissions: { read: true, write: true, sys: ["umask"] },
   },
   async function openMode() {
     const path = (await Deno.makeTempDir()) + "/test_open.txt";
@@ -69,7 +119,7 @@ Deno.test(
 
 Deno.test(
   {
-    permissions: { read: true, write: true },
+    permissions: { read: true, write: true, sys: ["umask"] },
   },
   function openSyncUrl() {
     const tempDir = Deno.makeTempDirSync();
@@ -94,7 +144,7 @@ Deno.test(
 
 Deno.test(
   {
-    permissions: { read: true, write: true },
+    permissions: { read: true, write: true, sys: ["umask"] },
   },
   async function openUrl() {
     const tempDir = await Deno.makeTempDir();
@@ -626,6 +676,69 @@ Deno.test({ permissions: { read: true } }, async function readableStream() {
 });
 
 Deno.test(
+  {
+    permissions: { read: true },
+    sanitizeOps: true,
+    sanitizeResources: true,
+  },
+  async function readableStreamTakesOwnership() {
+    // Consuming `file.readable` to completion takes ownership of the file and
+    // closes it automatically, so the resource and op sanitizers should not
+    // report a leak even though `file` is never closed manually.
+    const filename = "tests/testdata/assets/hello.txt";
+    const file = await Deno.open(filename);
+    const chunks = await Array.fromAsync(file.readable);
+    assertEquals(chunks.length, 1);
+  },
+);
+
+Deno.test(
+  { permissions: { read: true } },
+  async function readableStreamClosedResourceErrorMessage() {
+    // Regression test for https://github.com/denoland/deno/issues/34958 —
+    // closing the file (e.g. via a `using` declaration or an explicit
+    // `.close()`) while its `.readable` stream is still being consumed should
+    // surface an actionable error rather than a terse "Bad resource ID".
+    const filename = "tests/testdata/assets/hello.txt";
+    const file = await Deno.open(filename);
+    const reader = file.readable.getReader();
+    file.close();
+    await assertRejects(
+      () => reader.read(),
+      Error,
+      "The stream's underlying resource was closed or consumed",
+    );
+  },
+);
+
+Deno.test(
+  { permissions: { read: true, write: true } },
+  async function writableStreamClosedResourceErrorMessage() {
+    // Regression test for https://github.com/denoland/deno/issues/34958 —
+    // the writable counterpart of the case above.
+    const tempFile = await Deno.makeTempFile();
+    try {
+      const file = await Deno.open(tempFile, { write: true });
+      const writer = file.writable.getWriter();
+      file.close();
+      // The file's writable stream buffers small writes (64 KiB), so write a
+      // chunk large enough to be flushed to the underlying resource directly.
+      // The flush errors the stream; the error surfaces on `writer.closed`.
+      await assertRejects(
+        async () => {
+          await writer.write(new Uint8Array(128 * 1024)).catch(() => {});
+          await writer.closed;
+        },
+        Error,
+        "The stream's underlying resource was closed or consumed",
+      );
+    } finally {
+      await Deno.remove(tempFile);
+    }
+  },
+);
+
+Deno.test(
   { permissions: { read: true } },
   async function readableStreamTextEncoderPipe() {
     const filename = "tests/testdata/assets/hello.txt";
@@ -637,6 +750,61 @@ Deno.test(
     }
     assertEquals(chunks.length, 1);
     assertEquals(chunks[0].length, 12);
+  },
+);
+
+Deno.test(
+  {
+    permissions: { read: true, write: true, run: true },
+    ignore: Deno.build.os === "windows",
+  },
+  async function readableStreamCancelOnFifo() {
+    // Regression test for https://github.com/denoland/deno/issues/21186
+    // — a `read` on a FIFO can block indefinitely waiting for data, and
+    // previously cancelling the wrapping `ReadableStream` would not
+    // unblock the in-flight `op_read`. As a result, the runtime would
+    // hang on exit even after JS had finished. We verify the fix by
+    // running a subprocess that opens a FIFO, starts a read, cancels
+    // it, and is expected to exit promptly. Without the fix the
+    // subprocess would hang until killed.
+    const tempDir = await Deno.makeTempDir();
+    const fifo = `${tempDir}/fifo`;
+    try {
+      const mkfifo = new Deno.Command("mkfifo", { args: [fifo] }).outputSync();
+      if (mkfifo.code !== 0) {
+        throw new Error(
+          `mkfifo failed: ${new TextDecoder().decode(mkfifo.stderr)}`,
+        );
+      }
+      const script = `
+        const fifo = ${JSON.stringify(fifo)};
+        // O_RDWR avoids the POSIX FIFO open-blocks-on-peer semantics.
+        const file = await Deno.open(fifo, { read: true, write: true });
+        const r = file.readable.getReader();
+        const reading = r.read();
+        await new Promise((res) => setTimeout(res, 50));
+        await r.cancel();
+        await reading;
+      `;
+      const out = await new Deno.Command(Deno.execPath(), {
+        args: ["eval", script],
+        stdout: "null",
+        stderr: "piped",
+        signal: AbortSignal.timeout(10_000),
+      }).output();
+      if (out.signal !== null) {
+        throw new Error(
+          "subprocess hung after stream cancellation — read was not cancelled",
+        );
+      }
+      assertEquals(
+        out.code,
+        0,
+        `subprocess failed: ${new TextDecoder().decode(out.stderr)}`,
+      );
+    } finally {
+      await Deno.remove(tempDir, { recursive: true });
+    }
   },
 );
 
@@ -790,6 +958,90 @@ Deno.test(
   { permissions: { read: true, run: true } },
   async function fsFileLockFileAsync() {
     await runFlockTests({ sync: false });
+  },
+);
+
+Deno.test(
+  { permissions: { read: true, write: true } },
+  function fsFileTryLockSync() {
+    const path = Deno.makeTempFileSync();
+    try {
+      using file1 = Deno.openSync(path, { read: true, write: true });
+      using file2 = Deno.openSync(path, { read: true, write: true });
+
+      // First lock should succeed
+      assertEquals(file1.tryLockSync(true), true);
+
+      // Second exclusive lock should fail (returns false, not block)
+      assertEquals(file2.tryLockSync(true), false);
+
+      // Shared lock should also fail when exclusive is held
+      assertEquals(file2.tryLockSync(false), false);
+
+      // Unlock first file
+      file1.unlockSync();
+
+      // Now second file should be able to lock
+      assertEquals(file2.tryLockSync(true), true);
+      file2.unlockSync();
+    } finally {
+      Deno.removeSync(path);
+    }
+  },
+);
+
+Deno.test(
+  { permissions: { read: true, write: true } },
+  async function fsFileTryLockAsync() {
+    const path = await Deno.makeTempFile();
+    try {
+      using file1 = await Deno.open(path, { read: true, write: true });
+      using file2 = await Deno.open(path, { read: true, write: true });
+
+      // First lock should succeed
+      assertEquals(await file1.tryLock(true), true);
+
+      // Second exclusive lock should fail (returns false, not block)
+      assertEquals(await file2.tryLock(true), false);
+
+      // Shared lock should also fail when exclusive is held
+      assertEquals(await file2.tryLock(false), false);
+
+      // Unlock first file
+      await file1.unlock();
+
+      // Now second file should be able to lock
+      assertEquals(await file2.tryLock(true), true);
+      await file2.unlock();
+    } finally {
+      await Deno.remove(path);
+    }
+  },
+);
+
+Deno.test(
+  { permissions: { read: true, write: true } },
+  function fsFileTryLockSharedSync() {
+    const path = Deno.makeTempFileSync();
+    try {
+      using file1 = Deno.openSync(path, { read: true, write: true });
+      using file2 = Deno.openSync(path, { read: true, write: true });
+
+      // First shared lock should succeed
+      assertEquals(file1.tryLockSync(false), true);
+
+      // Second shared lock should also succeed
+      assertEquals(file2.tryLockSync(false), true);
+
+      // Exclusive lock should fail when shared locks are held
+      using file3 = Deno.openSync(path, { read: true, write: true });
+      assertEquals(file3.tryLockSync(true), false);
+
+      file1.unlockSync();
+      file2.unlockSync();
+    } finally {
+      Deno.removeSync(path);
+    }
   },
 );
 
